@@ -1,0 +1,24 @@
+[project]
+name = "hwp-doc-workflow"
+version = "0.1.0"
+description = "HWP/HWPX document review workflow for Mistral Workflows"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "mistralai-workflows[mistralai]>=3.15.0",
+    "pydantic>=2.14.1",
+    "python-docx>=1.1.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25.3"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "worker"
