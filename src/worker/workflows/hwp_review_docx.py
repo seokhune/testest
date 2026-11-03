@@ -1,0 +1,291 @@
+"""DOCX parsing, rewriting, report building, and Hancom format conversion.
+
+Helpers used by the HWP review workflow activities. All functions are plain
+synchronous code: network I/O and subprocess calls stay in the activities that
+call them.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import io
+import subprocess
+import tempfile
+from pathlib import Path
+
+from lxml import etree
+
+from worker.workflows.hwp_review_models import (
+    BodyBlock,
+    BodyFootnoteDifference,
+    ExtractedDocument,
+    FootnoteItem,
+    HanjaTranslation,
+    SourceAnnotation,
+    TextEdit,
+)
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+FOOTNOTES_RELTYPE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
+)
+SEPARATOR_FOOTNOTE_IDS = {"0", "-1", "none"}
+
+DOCX_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+
+HANCOM_EXTENSIONS = (".hwp", ".hwpx")
+HANCOM_INFILTERS = {"hwp": "Hwp2002_File", "hwpx": "Hwp2002_Reader"}
+
+
+def _w(tag: str) -> str:
+    return f"{{{W_NS}}}{tag}"
+
+
+def _element_text(element: etree._Element) -> str:
+    return "".join(t.text or "" for t in element.iter(_w("t")))
+
+
+def contains_hanja(text: str) -> bool:
+    return any(
+        "\u3400" <= ch <= "\u4dbf"
+        or "\u4e00" <= ch <= "\u9fff"
+        or "\uf900" <= ch <= "\ufaff"
+        for ch in text
+    )
+
+
+def _footnotes_part(document):
+    for rel in document.part.rels.values():
+        if rel.reltype == FOOTNOTES_RELTYPE:
+            return rel.target_part
+    return None
+
+
+def _footnotes_root(document) -> etree._Element | None:
+    part = _footnotes_part(document)
+    if part is None:
+        return None
+    return etree.fromstring(part.blob)
+
+
+def _body_paragraphs(document) -> list[etree._Element]:
+    return [p for p in document.element.body.iter(_w("p")) if _element_text(p).strip()]
+
+
+def _footnote_elements(root: etree._Element) -> dict[str, etree._Element]:
+    footnotes: dict[str, etree._Element] = {}
+    for footnote in root.findall(_w("footnote")):
+        footnote_id = footnote.get(_w("id"))
+        if footnote_id is None or footnote_id in SEPARATOR_FOOTNOTE_IDS:
+            continue
+        footnotes[footnote_id] = footnote
+    return footnotes
+
+
+def _first_paragraph(element: etree._Element) -> etree._Element | None:
+    paragraphs = element.findall(_w("p"))
+    return paragraphs[0] if paragraphs else None
+
+
+def _replace_paragraph_text(paragraph: etree._Element, revised: str) -> None:
+    rpr = None
+    for run in paragraph.iter(_w("r")):
+        candidate = run.find(_w("rPr"))
+        if candidate is not None:
+            rpr = copy.deepcopy(candidate)
+            break
+    for run in list(paragraph.iter(_w("r"))):
+        run.getparent().remove(run)
+    for wrapper in list(paragraph.iter(_w("hyperlink"))):
+        wrapper.getparent().remove(wrapper)
+    run = etree.SubElement(paragraph, _w("r"))
+    if rpr is not None:
+        run.append(rpr)
+    t = etree.SubElement(run, _w("t"))
+    t.set(f"{{{XML_NS}}}space", "preserve")
+    t.text = revised
+
+
+def _append_run(paragraph: etree._Element, text: str) -> None:
+    run = etree.SubElement(paragraph, _w("r"))
+    t = etree.SubElement(run, _w("t"))
+    t.set(f"{{{XML_NS}}}space", "preserve")
+    t.text = text
+
+
+def extract_document(docx_bytes: bytes, source_format: str) -> ExtractedDocument:
+    from docx import Document
+
+    document = Document(io.BytesIO(docx_bytes))
+    body: list[BodyBlock] = []
+    for index, paragraph in enumerate(_body_paragraphs(document)):
+        body.append(
+            BodyBlock(block_id=f"p{index}", text=_element_text(paragraph).strip())
+        )
+
+    footnotes: list[FootnoteItem] = []
+    footnotes_root = _footnotes_root(document)
+    if footnotes_root is not None:
+        for footnote_id, footnote in _footnote_elements(footnotes_root).items():
+            text = _element_text(footnote).strip()
+            if text:
+                footnotes.append(FootnoteItem(footnote_id=footnote_id, text=text))
+
+    return ExtractedDocument(
+        source_format=source_format,
+        docx_b64=base64.b64encode(docx_bytes).decode(),
+        body=body,
+        footnotes=footnotes,
+    )
+
+
+def apply_review_edits(
+    docx_bytes: bytes,
+    body_edits: list[TextEdit],
+    footnote_edits: list[TextEdit],
+    source_annotations: list[SourceAnnotation],
+    hanja_translations: list[HanjaTranslation],
+) -> bytes:
+    from docx import Document
+
+    document = Document(io.BytesIO(docx_bytes))
+    body_by_id = {f"p{index}": p for index, p in enumerate(_body_paragraphs(document))}
+
+    for edit in body_edits:
+        paragraph = body_by_id.get(edit.item_id)
+        if paragraph is not None:
+            _replace_paragraph_text(paragraph, edit.revised)
+
+    footnotes_root = _footnotes_root(document)
+    if footnotes_root is not None:
+        footnotes = _footnote_elements(footnotes_root)
+        for edit in footnote_edits:
+            footnote = footnotes.get(edit.item_id)
+            if footnote is None:
+                continue
+            paragraph = _first_paragraph(footnote)
+            if paragraph is None:
+                paragraph = etree.SubElement(footnote, _w("p"))
+            _replace_paragraph_text(paragraph, edit.revised)
+        for annotation in source_annotations:
+            footnote = footnotes.get(annotation.item_id)
+            if footnote is None:
+                continue
+            paragraph = _first_paragraph(footnote)
+            if paragraph is None:
+                paragraph = etree.SubElement(footnote, _w("p"))
+            _append_run(paragraph, f" [출처: {annotation.source}]")
+        for translation in hanja_translations:
+            footnote = footnotes.get(translation.item_id)
+            if footnote is None:
+                continue
+            translated = etree.SubElement(footnote, _w("p"))
+            _append_run(translated, f"번역: {translation.translation}")
+        part = _footnotes_part(document)
+        if part is not None:
+            part._blob = etree.tostring(
+                footnotes_root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def build_report_docx(
+    source_title: str,
+    body_edits: list[TextEdit],
+    footnote_edits: list[TextEdit],
+    source_annotations: list[SourceAnnotation],
+    hanja_translations: list[HanjaTranslation],
+    differences: list[BodyFootnoteDifference],
+) -> bytes:
+    from docx import Document
+
+    document = Document()
+    document.add_heading("문서 검수 리포트", level=0)
+    document.add_paragraph(f"원본 파일: {source_title}")
+
+    document.add_heading("1. 본문 교정 (오탈자·윤문)", level=1)
+    if not body_edits:
+        document.add_paragraph("변경 사항 없음")
+    for edit in body_edits:
+        document.add_paragraph(f"[{edit.item_id}] ({edit.category}) {edit.reason}")
+        document.add_paragraph(f"원문: {edit.original}")
+        document.add_paragraph(f"수정: {edit.revised}")
+
+    document.add_heading("2. 주석 교정 (오탈자·윤문·서지명 〈 〉)", level=1)
+    if not footnote_edits:
+        document.add_paragraph("변경 사항 없음")
+    for edit in footnote_edits:
+        document.add_paragraph(f"[주석 {edit.item_id}] ({edit.category}) {edit.reason}")
+        document.add_paragraph(f"원문: {edit.original}")
+        document.add_paragraph(f"수정: {edit.revised}")
+
+    document.add_heading("3. 주석 출처 보완", level=1)
+    if not source_annotations:
+        document.add_paragraph("추가된 출처 없음")
+    for annotation in source_annotations:
+        document.add_paragraph(f"[주석 {annotation.item_id}] 출처: {annotation.source}")
+
+    document.add_heading("4. 한문 주석 번역", level=1)
+    if not hanja_translations:
+        document.add_paragraph("한문 주석 없음")
+    for translation in hanja_translations:
+        document.add_paragraph(
+            f"[주석 {translation.item_id}] 원문: {translation.original}"
+        )
+        document.add_paragraph(f"번역: {translation.translation}")
+
+    document.add_heading("5. 본문-주석 차이점", level=1)
+    if not differences:
+        document.add_paragraph("차이점 없음")
+    for difference in differences:
+        location = difference.body_block_id or "-"
+        footnote = difference.footnote_id or "-"
+        document.add_paragraph(
+            f"[본문 {location} / 주석 {footnote}] {difference.difference}"
+        )
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def convert_hancom_to_docx(source_bytes: bytes, source_ext: str) -> bytes:
+    ext = source_ext.lower().lstrip(".")
+    if ext not in HANCOM_INFILTERS:
+        raise ValueError(f"지원하지 않는 한컴 문서 형식입니다: {source_ext}")
+    infilter = HANCOM_INFILTERS[ext]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        source_path = tmp / f"source.{ext}"
+        source_path.write_bytes(source_bytes)
+        output_path = tmp / "source.docx"
+        for extra_args in (["--infilter", infilter], []):
+            output_path.unlink(missing_ok=True)
+            subprocess.run(
+                [
+                    "soffice",
+                    "--headless",
+                    "--norestore",
+                    *extra_args,
+                    "--convert-to",
+                    "docx",
+                    "--outdir",
+                    str(tmp),
+                    str(source_path),
+                ],
+                capture_output=True,
+                check=False,
+                timeout=300,
+            )
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return output_path.read_bytes()
+    raise RuntimeError(
+        "LibreOffice 변환에 실패했습니다. H2Orestart 확장이 설치되어 있는지 확인하십시오."
+    )
