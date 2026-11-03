@@ -11,7 +11,7 @@ RUN apt-get update && \
 # H2Orestart adds the Hancom (HWP 5.x / HWPX) import filters to LibreOffice
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/ebandal/H2Orestart/releases/download/v0.8.0/H2Orestart.oxt', '/tmp/H2Orestart.oxt')" && \
     echo "f36c19fa6b7dff1cf34114d926bdc088e6bcfa7fdc93d67eaafd3f572be1d62c  /tmp/H2Orestart.oxt" | sha256sum -c - && \
-    unopkg add --suppress-license /tmp/H2Orestart.oxt && \
+    unopkg add --shared --suppress-license /tmp/H2Orestart.oxt && \
     rm -f /tmp/H2Orestart.oxt
 
 WORKDIR /app
