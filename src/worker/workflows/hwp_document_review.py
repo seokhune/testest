@@ -31,8 +31,9 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 
 from worker.workflows.hwp_review_docx import (
+    ACCEPTED_SOURCE_EXTENSIONS,
+    DOCX_EXTENSION,
     DOCX_MIME_TYPE,
-    HANCOM_EXTENSIONS,
     apply_review_edits,
     build_report_docx,
     contains_hanja,
@@ -117,7 +118,7 @@ async def find_drive_file(
     candidates = [
         file
         for file in files
-        if (file.get("title") or "").lower().endswith(HANCOM_EXTENSIONS)
+        if (file.get("title") or "").lower().endswith(ACCEPTED_SOURCE_EXTENSIONS)
         and file_name.lower() in (file.get("title") or "").lower()
     ]
     if not candidates:
@@ -210,12 +211,22 @@ async def upload_drive_file(
 @workflows.activity(
     name="hwp-convert-and-extract", start_to_close_timeout=CONVERT_TIMEOUT
 )
-async def convert_and_extract(content_b64: str, file_title: str) -> ExtractedDocument:
+async def convert_and_extract(
+    content_b64: str,
+    file_title: str,
+    page_start: int | None = None,
+    page_end: int | None = None,
+) -> ExtractedDocument:
     source_bytes = base64.b64decode(content_b64)
     ext = file_title.rsplit(".", 1)[-1].lower() if "." in file_title else ""
-    async with _SOFFICE_LOCK:
-        docx_bytes = await asyncio.to_thread(convert_hancom_to_docx, source_bytes, ext)
-    return extract_document(docx_bytes, source_format=ext)
+    if ext == DOCX_EXTENSION.lstrip("."):
+        docx_bytes = source_bytes
+    else:
+        async with _SOFFICE_LOCK:
+            docx_bytes = await asyncio.to_thread(convert_hancom_to_docx, source_bytes, ext)
+    return extract_document(
+        docx_bytes, source_format=ext, page_start=page_start, page_end=page_end
+    )
 
 
 class _EditBatch(pydantic.BaseModel):
@@ -429,7 +440,9 @@ class HwpDocumentReviewWorkflow:
             source.file_id, f"{stem}_검수사본", output_parent_id
         )
         content_b64 = await download_drive_file(source.file_id)
-        document = await convert_and_extract(content_b64, source.title)
+        document = await convert_and_extract(
+            content_b64, source.title, data.page_start, data.page_end
+        )
 
         body_edits = await proofread_body(document.body)
         footnote_edits = await polish_footnotes(document.footnotes)
@@ -453,11 +466,17 @@ class HwpDocumentReviewWorkflow:
             differences,
         )
 
+        range_suffix = ""
+        if data.page_start is not None or data.page_end is not None:
+            range_start = data.page_start or 1
+            range_end = data.page_end or document.total_pages
+            range_suffix = f"_p{range_start}-{range_end}"
+
         corrected = await upload_drive_file(
-            f"{stem}_교정본.docx", corrected_b64, output_parent_id
+            f"{stem}_교정본{range_suffix}.docx", corrected_b64, output_parent_id
         )
         report = await upload_drive_file(
-            f"{stem}_교정리포트.docx", report_b64, output_parent_id
+            f"{stem}_교정리포트{range_suffix}.docx", report_b64, output_parent_id
         )
 
         stats = {
@@ -468,9 +487,18 @@ class HwpDocumentReviewWorkflow:
             "source_annotations": len(source_annotations),
             "hanja_translations": len(hanja_translations),
             "body_footnote_differences": len(differences),
+            "total_pages": document.total_pages,
+            "page_start": data.page_start or 0,
+            "page_end": data.page_end or 0,
         }
+        page_note = ""
+        if range_suffix:
+            page_note = (
+                f" (총 {document.total_pages}페이지 중 "
+                f"{data.page_start or 1}~{data.page_end or document.total_pages}페이지)"
+            )
         summary = (
-            f"본문 {len(document.body)}문단, 주석 {len(document.footnotes)}건을 검수해 "
+            f"본문 {len(document.body)}문단, 주석 {len(document.footnotes)}건을 검수해{page_note} "
             f"본문 {len(body_edits)}건, 주석 {len(footnote_edits)}건을 교정하고 "
             f"출처 {len(source_annotations)}건을 보완했으며, 한문 주석 "
             f"{len(hanja_translations)}건을 번역했습니다. 본문-주석 차이점 "

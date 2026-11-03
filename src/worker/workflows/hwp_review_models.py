@@ -14,6 +14,7 @@ class DriveFileInfo(pydantic.BaseModel):
 class BodyBlock(pydantic.BaseModel):
     block_id: str
     text: str
+    page: int = 1
 
 
 class FootnoteItem(pydantic.BaseModel):
@@ -26,6 +27,9 @@ class ExtractedDocument(pydantic.BaseModel):
     docx_b64: str
     body: list[BodyBlock]
     footnotes: list[FootnoteItem]
+    total_pages: int = 1
+    page_start: int | None = None
+    page_end: int | None = None
 
 
 class TextEdit(pydantic.BaseModel):
@@ -56,6 +60,8 @@ class BodyFootnoteDifference(pydantic.BaseModel):
 class HwpReviewInput(pydantic.BaseModel):
     file_name: str
     output_parent_id: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
 
 
 class HwpReviewOutput(pydantic.BaseModel):

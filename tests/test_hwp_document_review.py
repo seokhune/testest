@@ -190,9 +190,14 @@ async def test_hwp_document_review_end_to_end(temporal_env, monkeypatch) -> None
 
     @workflows.activity(name="hwp-convert-and-extract")
     async def fake_convert_and_extract(
-        content: str, file_title: str
+        content: str,
+        file_title: str,
+        page_start: int | None = None,
+        page_end: int | None = None,
     ) -> ExtractedDocument:
-        return extract_document(docx_bytes, source_format="hwp")
+        return extract_document(
+            docx_bytes, source_format="hwp", page_start=page_start, page_end=page_end
+        )
 
     async def fake_parse(model_class, request):
         prompt = request.messages[-1].content

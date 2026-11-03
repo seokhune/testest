@@ -39,6 +39,8 @@ DOCX_MIME_TYPE = (
 
 HANCOM_EXTENSIONS = (".hwp", ".hwpx")
 HANCOM_INFILTERS = {"hwp": "Hwp2002_File", "hwpx": "Hwp2002_Reader"}
+DOCX_EXTENSION = ".docx"
+ACCEPTED_SOURCE_EXTENSIONS = HANCOM_EXTENSIONS + (DOCX_EXTENSION,)
 
 
 def _w(tag: str) -> str:
@@ -47,6 +49,24 @@ def _w(tag: str) -> str:
 
 def _element_text(element: etree._Element) -> str:
     return "".join(t.text or "" for t in element.iter(_w("t")))
+
+
+def _page_break_count(element: etree._Element) -> int:
+    count = 0
+    for br in element.iter(_w("br")):
+        if br.get(_w("type")) == "page":
+            count += 1
+    for _ in element.iter(_w("lastRenderedPageBreak")):
+        count += 1
+    return count
+
+
+def _footnote_refs(element: etree._Element) -> set[str]:
+    return {
+        ref.get(_w("id"))
+        for ref in element.iter(_w("footnoteReference"))
+        if ref.get(_w("id")) is not None
+    }
 
 
 def contains_hanja(text: str) -> bool:
@@ -117,15 +137,30 @@ def _append_run(paragraph: etree._Element, text: str) -> None:
     t.text = text
 
 
-def extract_document(docx_bytes: bytes, source_format: str) -> ExtractedDocument:
+def extract_document(
+    docx_bytes: bytes,
+    source_format: str,
+    page_start: int | None = None,
+    page_end: int | None = None,
+) -> ExtractedDocument:
     from docx import Document
 
     document = Document(io.BytesIO(docx_bytes))
     body: list[BodyBlock] = []
-    for index, paragraph in enumerate(_body_paragraphs(document)):
-        body.append(
-            BodyBlock(block_id=f"p{index}", text=_element_text(paragraph).strip())
-        )
+    block_refs: dict[str, set[str]] = {}
+    page = 1
+    total_pages = 1
+    nonempty_index = 0
+    for paragraph in document.element.body.iter(_w("p")):
+        text = _element_text(paragraph).strip()
+        if text:
+            block_id = f"p{nonempty_index}"
+            body.append(BodyBlock(block_id=block_id, text=text, page=page))
+            block_refs[block_id] = _footnote_refs(paragraph)
+            nonempty_index += 1
+        page += _page_break_count(paragraph)
+        if page > total_pages:
+            total_pages = page
 
     footnotes: list[FootnoteItem] = []
     footnotes_root = _footnotes_root(document)
@@ -135,11 +170,21 @@ def extract_document(docx_bytes: bytes, source_format: str) -> ExtractedDocument
             if text:
                 footnotes.append(FootnoteItem(footnote_id=footnote_id, text=text))
 
+    if page_start is not None or page_end is not None:
+        start = page_start or 1
+        end = page_end or total_pages
+        body = [block for block in body if start <= block.page <= end]
+        kept_refs = set().union(*(block_refs[block.block_id] for block in body)) if body else set()
+        footnotes = [f for f in footnotes if f.footnote_id in kept_refs]
+
     return ExtractedDocument(
         source_format=source_format,
         docx_b64=base64.b64encode(docx_bytes).decode(),
         body=body,
         footnotes=footnotes,
+        total_pages=total_pages,
+        page_start=page_start,
+        page_end=page_end,
     )
 
 
