@@ -319,6 +319,7 @@ async def build_output_docx(
 async def build_inplace_edition(
     source: DriveFileInfo,
     pages: list[tuple[int, str]],
+    blocks: list[BodyBlock],
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
     client: ToolCallClient = Depends(drive),
@@ -356,7 +357,7 @@ async def build_inplace_edition(
                     "원본 양식 변환 실패, 구조 재구성으로 대체: %s", error
                 )
     edited, applied = await asyncio.to_thread(
-        build_structured_docx, pages, body_edits, hanja_translations
+        build_structured_docx, pages, blocks, body_edits, hanja_translations
     )
     return base64.b64encode(edited).decode(), applied
 
@@ -433,7 +434,7 @@ class PdfDocumentReviewWorkflow:
         )
 
         inplace_b64, applied = await build_inplace_edition(
-            source, pages, body_edits, hanja_translations
+            source, pages, blocks, body_edits, hanja_translations
         )
         inplace_file = await upload_drive_file(
             f"{stem}{range_suffix}_수정반영본.docx",

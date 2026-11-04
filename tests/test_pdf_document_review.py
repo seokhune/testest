@@ -120,6 +120,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     async def fake_build_inplace(
         source: DriveFileInfo,
         pages: list[tuple[int, str]],
+        blocks: list,
         body_edits: list[TextEdit],
         hanja_translations: list[HanjaTranslation],
     ) -> tuple[str, int]:
@@ -171,22 +172,28 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
 
 
 def test_build_structured_docx_preserves_pages_and_applies_edits() -> None:
+    from worker.workflows.hwp_review_models import BodyBlock
     from worker.workflows.hwp_review_docx import build_structured_docx
 
     pages = [
         (8, "첫 문단입니다.\n\n고려 태조 원년의 기사이다."),
         (9, "둘째 페이지 문단입니다."),
     ]
+    blocks = [
+        BodyBlock(block_id="p0", text="첫 문단입니다.", page=8),
+        BodyBlock(block_id="p1", text="고려 태조 원년의 기사이다.", page=8),
+        BodyBlock(block_id="p2", text="둘째 페이지 문단입니다.", page=9),
+    ]
     edits = [
         TextEdit(
             item_id="p1",
-            original="고려 태조 원년의 기사이다.",
+            original="원문과 달라도 상관없다",
             revised="고려 태조 원년의 기사다.",
             category="grammar",
             reason="문맥상 종결형",
         )
     ]
-    result, applied = build_structured_docx(pages, edits, [])
+    result, applied = build_structured_docx(pages, blocks, edits, [])
     assert applied == 1
 
     import io
@@ -197,6 +204,7 @@ def test_build_structured_docx_preserves_pages_and_applies_edits() -> None:
     texts = [p.text for p in document.paragraphs]
     assert "- 8 -" in texts and "- 9 -" in texts
     assert "고려 태조 원년의 기사다." in texts
+    assert "원문과 달라도 상관없다" not in " ".join(texts)
 
 
 def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:

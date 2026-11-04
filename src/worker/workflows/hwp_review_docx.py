@@ -493,14 +493,15 @@ def apply_edits_by_text(
 
 def build_structured_docx(
     pages: list[tuple[int, str]],
+    blocks: list,
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
 ) -> tuple[bytes, int]:
     """추출된 페이지 텍스트로 원본 구조를 재구성한 DOCX를 만든다.
 
-    각 페이지는 원본 쪽번호 표식(- 8 - 형태)과 문단 순서를 유지하고,
-    교정은 문단 원문 일치로 찾아 그 자리에 반영한다. 원본 바이너리를
-    받을 수 없는 큰 파일의 수정반영본 fallback으로 쓴다.
+    각 페이지는 원본 쪽번호 표식(- 8 - 형태)과 문단 순서를 유지한다.
+    문단은 pages와 동일한 순서로 만들어지므로 blocks의 block_id로
+    교정/번역을 정확히 그 자리에 반영한다.
     """
     import re
     import io
@@ -508,34 +509,29 @@ def build_structured_docx(
     from docx import Document
     from docx.enum.text import WD_BREAK
 
-    def _norm(text: str) -> str:
-        return "".join(text.split())
-
-    edits_by_text = {_norm(edit.original): edit for edit in body_edits}
-    hanja_by_text = {_norm(t.original): t for t in hanja_translations}
-    used_edits: set[str] = set()
-    used_hanja: set[str] = set()
+    edits_by_id = {edit.item_id: edit for edit in body_edits}
+    hanja_by_id = {t.item_id: t for t in hanja_translations}
     applied = 0
 
     document = Document()
-    for index, (page_number, page_text) in enumerate(pages):
-        if index > 0:
+    paragraph_index = 0
+    for page_index, (page_number, page_text) in enumerate(pages):
+        if page_index > 0:
             document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
         document.add_paragraph(f"- {page_number} -")
         for paragraph_text in re.split(r"\n\s*\n", page_text):
             cleaned = paragraph_text.strip()
             if not cleaned:
                 continue
-            document.add_paragraph(edits_by_text[_norm(cleaned)].revised
-                                    if _norm(cleaned) in edits_by_text
-                                    else cleaned)
-            key = _norm(cleaned)
-            if key in edits_by_text and key not in used_edits:
-                used_edits.add(key)
+            block_id = f"p{paragraph_index}"
+            edit = edits_by_id.get(block_id)
+            document.add_paragraph(edit.revised if edit else cleaned)
+            if edit:
                 applied += 1
-            if key in hanja_by_text and key not in used_hanja:
-                used_hanja.add(key)
-                document.add_paragraph(f"번역: {hanja_by_text[key].translation}")
+            translation = hanja_by_id.get(block_id)
+            if translation:
+                document.add_paragraph(f"번역: {translation.translation}")
+            paragraph_index += 1
 
     buffer = io.BytesIO()
     document.save(buffer)
