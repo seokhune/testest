@@ -337,7 +337,12 @@ async def build_inplace_edition(
         edited, applied = await asyncio.to_thread(
             apply_edits_by_text, docx_bytes, body_edits, hanja_translations
         )
-    except Exception:
+    except Exception as error:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "수정반영본 생성 실패: %s", error
+        )
         return None
     return base64.b64encode(edited).decode(), applied
 

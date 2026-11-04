@@ -5,7 +5,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.17 /uv /uvx /bin/
 
 # libreoffice-writer: HWP/HWPX -> DOCX conversion, fonts-nanum: Korean text rendering
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libreoffice-writer fonts-nanum default-jre-headless && \
+    apt-get install -y --no-install-recommends libreoffice-writer libreoffice-draw fonts-nanum default-jre-headless && \
     rm -rf /var/lib/apt/lists/*
 
 # H2Orestart adds the Hancom (HWP 5.x / HWPX) import filters to LibreOffice.
