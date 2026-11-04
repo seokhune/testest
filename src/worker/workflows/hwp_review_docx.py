@@ -321,9 +321,10 @@ def _soffice_convert(
         if infilter:
             attempts.append(["--infilter", infilter])
         attempts.append([])
+        last_error = ""
         for extra_args in attempts:
             output_path.unlink(missing_ok=True)
-            subprocess.run(
+            completed = subprocess.run(
                 [
                     "soffice",
                     "--headless",
@@ -341,7 +342,11 @@ def _soffice_convert(
             )
             if output_path.exists() and output_path.stat().st_size > 0:
                 return output_path.read_bytes()
-    raise RuntimeError(f"LibreOffice {target_format} 변환에 실패했습니다.")
+            last_error = (completed.stderr or b"").decode(errors="replace").strip()
+    raise RuntimeError(
+        f"LibreOffice {target_format} 변환에 실패했습니다."
+        + (f" ({last_error})" if last_error else "")
+    )
 
 
 def convert_hancom_to_docx(source_bytes: bytes, source_ext: str) -> bytes:
