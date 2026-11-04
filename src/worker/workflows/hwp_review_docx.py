@@ -317,7 +317,11 @@ def _soffice_convert(
         source_path = tmp / source_name
         source_path.write_bytes(source_bytes)
         output_path = tmp / f"{source_path.stem}.{target_format}"
-        for extra_args in (["--infilter", infilter], []):
+        attempts: list[list[str]] = []
+        if infilter:
+            attempts.append(["--infilter", infilter])
+        attempts.append([])
+        for extra_args in attempts:
             output_path.unlink(missing_ok=True)
             subprocess.run(
                 [
