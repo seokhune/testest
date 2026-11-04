@@ -133,6 +133,13 @@ async def find_drive_file(
             non_retryable=True,
         )
     file = candidates[0]
+    size = int(file.get("file_size") or 0)
+    if size and size * 4 // 3 > 1_572_000:
+        raise workflows.WorkflowError(
+            f"파일이 커넥터 전송 한도(base64 2MB)를 초과합니다: {file.get('title')} "
+            f"({size:,}바이트). 필요한 페이지 범위만 별도 파일로 잘라 업로드해 주세요.",
+            non_retryable=True,
+        )
     return DriveFileInfo(
         file_id=file.get("id") or "",
         title=file.get("title") or "",
