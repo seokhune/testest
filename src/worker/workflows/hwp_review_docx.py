@@ -361,7 +361,22 @@ def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
 
 
 def convert_pdf_to_docx(pdf_bytes: bytes) -> bytes:
-    return _soffice_convert(pdf_bytes, "source.pdf", "docx")
+    """PDF를 양식을 보존하는 DOCX로 변환한다 (pdf2docx 기반)."""
+    from pdf2docx import Converter
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        source_path = tmp / "source.pdf"
+        source_path.write_bytes(pdf_bytes)
+        output_path = tmp / "source.docx"
+        converter = Converter(str(source_path))
+        try:
+            converter.convert(str(output_path))
+        finally:
+            converter.close()
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return output_path.read_bytes()
+    raise RuntimeError("PDF->DOCX 변환에 실패했습니다.")
 
 
 def pdf_page_texts(pdf_bytes: bytes) -> list[str]:
