@@ -119,9 +119,10 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     @sdk_workflows.activity(name="pdf-build-inplace")
     async def fake_build_inplace(
         source: DriveFileInfo,
+        pages: list[tuple[int, str]],
         body_edits: list[TextEdit],
         hanja_translations: list[HanjaTranslation],
-    ) -> tuple[str, int] | None:
+    ) -> tuple[str, int]:
         docx_bytes = _docx_bytes_from_paragraphs(["원본 양식 문단입니다."])
         return base64.b64encode(docx_bytes).decode(), 1
 
@@ -167,6 +168,35 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     ]
     assert output.inplace_file is not None
     assert "수정반영본에 1건" in output.summary
+
+
+def test_build_structured_docx_preserves_pages_and_applies_edits() -> None:
+    from worker.workflows.hwp_review_docx import build_structured_docx
+
+    pages = [
+        (8, "첫 문단입니다.\n\n고려 태조 원년의 기사이다."),
+        (9, "둘째 페이지 문단입니다."),
+    ]
+    edits = [
+        TextEdit(
+            item_id="p1",
+            original="고려 태조 원년의 기사이다.",
+            revised="고려 태조 원년의 기사다.",
+            category="grammar",
+            reason="문맥상 종결형",
+        )
+    ]
+    result, applied = build_structured_docx(pages, edits, [])
+    assert applied == 1
+
+    import io
+
+    from docx import Document
+
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+    assert "- 8 -" in texts and "- 9 -" in texts
+    assert "고려 태조 원년의 기사다." in texts
 
 
 def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:

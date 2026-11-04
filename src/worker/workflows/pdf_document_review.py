@@ -39,6 +39,7 @@ from worker.workflows.hwp_review_models import (
 )
 from worker.workflows.hwp_review_docx import (
     apply_edits_by_text,
+    build_structured_docx,
     contains_hanja,
     convert_pdf_to_docx,
 )
@@ -99,12 +100,12 @@ def split_pdf_pages(text: str) -> list[tuple[int, str]]:
     ]
 
 
-def extract_page_blocks(
+def slice_pages(
     text: str,
     page_start: int | None = None,
     page_end: int | None = None,
-) -> tuple[list[BodyBlock], int]:
-    """텍스트를 페이지별 문단 블록으로 나누고, 페이지 범위로 슬라이싱한다."""
+) -> tuple[list[tuple[int, str]], int]:
+    """PDF 텍스트를 페이지 단위로 슬라이싱한다."""
     pages = split_pdf_pages(text)
     total_pages = max((number for number, _ in pages), default=1)
     selected = pages
@@ -120,6 +121,16 @@ def extract_page_blocks(
                 f"PDF에 페이지 표식(- 8 - 형태)이 있는지 확인해 주세요.",
                 non_retryable=True,
             )
+    return selected, total_pages
+
+
+def extract_page_blocks(
+    text: str,
+    page_start: int | None = None,
+    page_end: int | None = None,
+) -> tuple[list[BodyBlock], int]:
+    """텍스트를 페이지별 문단 블록으로 나누고, 페이지 범위로 슬라이싱한다."""
+    selected, total_pages = slice_pages(text, page_start, page_end)
     blocks: list[BodyBlock] = []
     for page_number, page_text in selected:
         for paragraph in re.split(r"\n\s*\n", page_text):
@@ -307,43 +318,46 @@ async def build_output_docx(
 )
 async def build_inplace_edition(
     source: DriveFileInfo,
+    pages: list[tuple[int, str]],
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
     client: ToolCallClient = Depends(drive),
-) -> tuple[str, int] | None:
-    """원본 PDF 양식을 유지한 수정반영본을 만든다.
+) -> tuple[str, int]:
+    """원본 양식/구조를 유지한 수정반영본을 만든다.
 
-    PDF 바이너리를 받아야 해서 커넥터 전송 한도(base64 2MB) 이내일 때만
-    가능하다. 한도를 넘거나 변환에 실패하면 None을 반환해 워크플로우가
-    계속 진행되도록 한다.
+    파일이 커넥터 전송 한도(base64 2MB) 이내면 원본 PDF를 pdf2docx로
+    변환해 완전한 원본 양식에 교정을 반영한다. 한도를 넘으면 원본
+    페이지 구조(쪽 표식·순서)를 재구성한 DOCX에 교정을 반영한다.
+    어떤 경우든 사용자가 파일을 나눌 필요는 없다.
     """
     import asyncio
     import base64
 
     size = source.file_size or 0
-    if size and size > MAX_TRANSFER_RAW_BYTES:
-        return None
-    result = await client.call_tool(
-        tool_name="download_file_content",
-        arguments={"file_id": source.file_id},
-    )
-    value = _tool_result_value(result)
-    content = value.get("content") if isinstance(value, dict) else value
-    if not content:
-        return None
-    try:
-        pdf_bytes = base64.b64decode(content)
-        docx_bytes = await asyncio.to_thread(convert_pdf_to_docx, pdf_bytes)
-        edited, applied = await asyncio.to_thread(
-            apply_edits_by_text, docx_bytes, body_edits, hanja_translations
+    if not size or size <= MAX_TRANSFER_RAW_BYTES:
+        result = await client.call_tool(
+            tool_name="download_file_content",
+            arguments={"file_id": source.file_id},
         )
-    except Exception as error:
-        import logging
+        value = _tool_result_value(result)
+        content = value.get("content") if isinstance(value, dict) else value
+        if content:
+            try:
+                pdf_bytes = base64.b64decode(content)
+                docx_bytes = await asyncio.to_thread(convert_pdf_to_docx, pdf_bytes)
+                edited, applied = await asyncio.to_thread(
+                    apply_edits_by_text, docx_bytes, body_edits, hanja_translations
+                )
+                return base64.b64encode(edited).decode(), applied
+            except Exception as error:
+                import logging
 
-        logging.getLogger(__name__).warning(
-            "수정반영본 생성 실패: %s", error
-        )
-        return None
+                logging.getLogger(__name__).warning(
+                    "원본 양식 변환 실패, 구조 재구성으로 대체: %s", error
+                )
+    edited, applied = await asyncio.to_thread(
+        build_structured_docx, pages, body_edits, hanja_translations
+    )
     return base64.b64encode(edited).decode(), applied
 
 
@@ -390,9 +404,13 @@ class PdfDocumentReviewWorkflow:
         output_parent_id = data.output_parent_id or source.parent_id
 
         text = await read_pdf_text(source.file_id)
-        blocks, total_pages = extract_page_blocks(
-            text, data.page_start, data.page_end
-        )
+        pages, total_pages = slice_pages(text, data.page_start, data.page_end)
+        blocks = [
+            BodyBlock(block_id=f"p{index}", text=paragraph.strip(), page=page_number)
+            for index, (page_number, page_text) in enumerate(pages)
+            for paragraph in re.split(r"\n\s*\n", page_text)
+            if paragraph.strip()
+        ]
 
         body_edits = await proofread_body(blocks)
         hanja_translations = await translate_hanja_blocks(blocks)
@@ -414,19 +432,15 @@ class PdfDocumentReviewWorkflow:
             f"{stem}{range_suffix}_검수리포트.docx", report_b64, output_parent_id
         )
 
-        inplace_file = None
-        inplace_result = await build_inplace_edition(
-            source, body_edits, hanja_translations
+        inplace_b64, applied = await build_inplace_edition(
+            source, pages, body_edits, hanja_translations
         )
-        inplace_note = ""
-        if inplace_result is not None:
-            inplace_b64, applied = inplace_result
-            inplace_file = await upload_drive_file(
-                f"{stem}{range_suffix}_수정반영본.docx",
-                inplace_b64,
-                output_parent_id,
-            )
-            inplace_note = f" 원본 양식 수정반영본에 {applied}건을 반영했습니다."
+        inplace_file = await upload_drive_file(
+            f"{stem}{range_suffix}_수정반영본.docx",
+            inplace_b64,
+            output_parent_id,
+        )
+        inplace_note = f" 수정반영본에 {applied}건을 반영했습니다."
 
         page_note = ""
         if range_suffix:
