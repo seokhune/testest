@@ -34,11 +34,14 @@ from worker.workflows.hwp_review_docx import (
     ACCEPTED_SOURCE_EXTENSIONS,
     DOCX_EXTENSION,
     DOCX_MIME_TYPE,
+    PDF_EXTENSION,
     apply_review_edits,
     build_report_docx,
-    contains_hanja,
+    convert_docx_to_pdf,
     convert_hancom_to_docx,
+    convert_pdf_to_docx,
     extract_document,
+    pdf_page_texts,
 )
 from worker.workflows.hwp_review_models import (
     BodyBlock,
@@ -219,13 +222,34 @@ async def convert_and_extract(
 ) -> ExtractedDocument:
     source_bytes = base64.b64decode(content_b64)
     ext = file_title.rsplit(".", 1)[-1].lower() if "." in file_title else ""
-    if ext == DOCX_EXTENSION.lstrip("."):
+    page_texts: list[str] | None
+    if ext == PDF_EXTENSION.lstrip("."):
+        async with _SOFFICE_LOCK:
+            docx_bytes = await asyncio.to_thread(convert_pdf_to_docx, source_bytes)
+        page_texts = pdf_page_texts(source_bytes)
+    elif ext == DOCX_EXTENSION.lstrip("."):
         docx_bytes = source_bytes
+        try:
+            async with _SOFFICE_LOCK:
+                pdf_bytes = await asyncio.to_thread(convert_docx_to_pdf, source_bytes)
+            page_texts = pdf_page_texts(pdf_bytes)
+        except Exception:
+            page_texts = None
     else:
         async with _SOFFICE_LOCK:
             docx_bytes = await asyncio.to_thread(convert_hancom_to_docx, source_bytes, ext)
+        try:
+            async with _SOFFICE_LOCK:
+                pdf_bytes = await asyncio.to_thread(convert_docx_to_pdf, docx_bytes)
+            page_texts = pdf_page_texts(pdf_bytes)
+        except Exception:
+            page_texts = None
     return extract_document(
-        docx_bytes, source_format=ext, page_start=page_start, page_end=page_end
+        docx_bytes,
+        source_format=ext,
+        page_start=page_start,
+        page_end=page_end,
+        page_texts=page_texts,
     )
 
 

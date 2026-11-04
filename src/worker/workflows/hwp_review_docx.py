@@ -40,7 +40,8 @@ DOCX_MIME_TYPE = (
 HANCOM_EXTENSIONS = (".hwp", ".hwpx")
 HANCOM_INFILTERS = {"hwp": "Hwp2002_File", "hwpx": "Hwp2002_Reader"}
 DOCX_EXTENSION = ".docx"
-ACCEPTED_SOURCE_EXTENSIONS = HANCOM_EXTENSIONS + (DOCX_EXTENSION,)
+PDF_EXTENSION = ".pdf"
+ACCEPTED_SOURCE_EXTENSIONS = HANCOM_EXTENSIONS + (DOCX_EXTENSION, PDF_EXTENSION)
 
 
 def _w(tag: str) -> str:
@@ -142,6 +143,7 @@ def extract_document(
     source_format: str,
     page_start: int | None = None,
     page_end: int | None = None,
+    page_texts: list[str] | None = None,
 ) -> ExtractedDocument:
     from docx import Document
 
@@ -161,6 +163,12 @@ def extract_document(
         page += _page_break_count(paragraph)
         if page > total_pages:
             total_pages = page
+
+    if page_texts is not None:
+        pages = assign_pages_from_pdf([block.text for block in body], page_texts)
+        for block, block_page in zip(body, pages, strict=True):
+            block.page = block_page
+        total_pages = max(len(page_texts), 1)
 
     footnotes: list[FootnoteItem] = []
     footnotes_root = _footnotes_root(document)
@@ -301,16 +309,14 @@ def build_report_docx(
     return buffer.getvalue()
 
 
-def convert_hancom_to_docx(source_bytes: bytes, source_ext: str) -> bytes:
-    ext = source_ext.lower().lstrip(".")
-    if ext not in HANCOM_INFILTERS:
-        raise ValueError(f"지원하지 않는 한컴 문서 형식입니다: {source_ext}")
-    infilter = HANCOM_INFILTERS[ext]
+def _soffice_convert(
+    source_bytes: bytes, source_name: str, target_format: str, infilter: str | None = None
+) -> bytes:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
-        source_path = tmp / f"source.{ext}"
+        source_path = tmp / source_name
         source_path.write_bytes(source_bytes)
-        output_path = tmp / "source.docx"
+        output_path = tmp / f"{source_path.stem}.{target_format}"
         for extra_args in (["--infilter", infilter], []):
             output_path.unlink(missing_ok=True)
             subprocess.run(
@@ -320,7 +326,7 @@ def convert_hancom_to_docx(source_bytes: bytes, source_ext: str) -> bytes:
                     "--norestore",
                     *extra_args,
                     "--convert-to",
-                    "docx",
+                    target_format,
                     "--outdir",
                     str(tmp),
                     str(source_path),
@@ -331,6 +337,72 @@ def convert_hancom_to_docx(source_bytes: bytes, source_ext: str) -> bytes:
             )
             if output_path.exists() and output_path.stat().st_size > 0:
                 return output_path.read_bytes()
-    raise RuntimeError(
-        "LibreOffice 변환에 실패했습니다. H2Orestart 확장이 설치되어 있는지 확인하십시오."
-    )
+    raise RuntimeError(f"LibreOffice {target_format} 변환에 실패했습니다.")
+
+
+def convert_hancom_to_docx(source_bytes: bytes, source_ext: str) -> bytes:
+    ext = source_ext.lower().lstrip(".")
+    if ext not in HANCOM_INFILTERS:
+        raise ValueError(f"지원하지 않는 한컴 문서 형식입니다: {source_ext}")
+    return _soffice_convert(source_bytes, f"source.{ext}", "docx", HANCOM_INFILTERS[ext])
+
+
+def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
+    return _soffice_convert(docx_bytes, "source.docx", "pdf")
+
+
+def convert_pdf_to_docx(pdf_bytes: bytes) -> bytes:
+    return _soffice_convert(pdf_bytes, "source.pdf", "docx")
+
+
+def pdf_page_texts(pdf_bytes: bytes) -> list[str]:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    return [(page.extract_text() or "") for page in reader.pages]
+
+
+def _normalize_for_match(text: str) -> str:
+    return "".join(text.split())
+
+
+def assign_pages_from_pdf(block_texts: list[str], page_texts: list[str]) -> list[int]:
+    if not page_texts:
+        return [1] * len(block_texts)
+    boundaries: list[int] = []
+    combined = ""
+    for page_text in page_texts:
+        boundaries.append(len(combined))
+        combined += _normalize_for_match(page_text)
+
+    def _page_at(offset: int) -> int:
+        page = 1
+        for index, boundary in enumerate(boundaries):
+            if offset >= boundary:
+                page = index + 1
+        return page
+
+    pages: list[int] = []
+    cursor = 0
+    last_page = 1
+    for text in block_texts:
+        needle = _normalize_for_match(text)
+        if not needle:
+            pages.append(last_page)
+            continue
+        found = -1
+        for length in (min(len(needle), 60), min(len(needle), 20), min(len(needle), 8)):
+            found = combined.find(needle[:length], cursor)
+            if found != -1:
+                cursor = found + length
+                break
+        if found == -1:
+            found = combined.find(needle, cursor)
+            if found != -1:
+                cursor = found + len(needle)
+        if found == -1:
+            pages.append(last_page)
+            continue
+        last_page = _page_at(found)
+        pages.append(last_page)
+    return pages

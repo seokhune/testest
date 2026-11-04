@@ -102,3 +102,57 @@ def test_apply_edits_uses_original_block_ids_after_slicing() -> None:
     document = extract_document(edited, source_format="docx")
     assert document.body[2].text == "셋째 페이지 수정 문단."
     assert document.body[2].page == 3
+
+
+def test_extract_with_pdf_page_texts_overrides_break_heuristic() -> None:
+    page_texts = [
+        "머리글 - 1 -\n첫째 페이지 문단.",
+        "머리글 - 2 -\n둘째 페이지 문단.",
+        "머리글 - 3 -\n셋째 페이지 문단.",
+    ]
+    document = extract_document(
+        make_paged_docx(), source_format="docx", page_texts=page_texts
+    )
+
+    assert [block.page for block in document.body] == [1, 2, 3]
+    assert document.total_pages == 3
+
+
+def test_extract_pdf_page_range_uses_real_pages() -> None:
+    # 페이지 나눔 태그가 없는(자연 흐름) 문서 + 실제 PDF 페이지 텍스트
+    body_xml = (
+        f'<w:document xmlns:w="{W_NS}"><w:body>'
+        f'{"".join(f"<w:p><w:r><w:t>{i}번째 문단 내용입니다.</w:t></w:r></w:p>" for i in range(1, 13))}'
+        "<w:sectPr/></w:body></w:document>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", CONTENT_TYPES_XML)
+        archive.writestr("_rels/.rels", ROOT_RELS_XML)
+        archive.writestr("word/document.xml", body_xml)
+
+    page_texts = [f"- {page} - " + f"{page}번째 문단 내용입니다. " * 3 for page in range(1, 13)]
+
+    full = extract_document(buffer.getvalue(), source_format="docx", page_texts=page_texts)
+    assert full.total_pages == 12
+    assert [block.page for block in full.body] == list(range(1, 13))
+
+    ranged = extract_document(
+        buffer.getvalue(),
+        source_format="docx",
+        page_start=8,
+        page_end=15,
+        page_texts=page_texts,
+    )
+    assert [block.page for block in ranged.body] == [8, 9, 10, 11, 12]
+    assert [block.text for block in ranged.body] == [
+        f"{i}번째 문단 내용입니다." for i in range(8, 13)
+    ]
+
+
+def test_assign_pages_matches_blocks_across_page_boundary() -> None:
+    from worker.workflows.hwp_review_docx import assign_pages_from_pdf
+
+    block_texts = ["한 문단이", "페이지를", "넘어갑니다"]
+    page_texts = ["한 문단이 페", "이지를 넘어갑니다"]
+    assert assign_pages_from_pdf(block_texts, page_texts) == [1, 1, 2]
