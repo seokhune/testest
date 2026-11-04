@@ -8,10 +8,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends libreoffice-writer fonts-nanum default-jre-headless && \
     rm -rf /var/lib/apt/lists/*
 
-# H2Orestart adds the Hancom (HWP 5.x / HWPX) import filters to LibreOffice
+# H2Orestart adds the Hancom (HWP 5.x / HWPX) import filters to LibreOffice.
+# Only needed for .hwp/.hwpx inputs; keep the build green even if the extension
+# install fails so .docx/.pdf reviews still deploy.
+ENV HOME=/tmp
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/ebandal/H2Orestart/releases/download/v0.8.0/H2Orestart.oxt', '/tmp/H2Orestart.oxt')" && \
     echo "f36c19fa6b7dff1cf34114d926bdc088e6bcfa7fdc93d67eaafd3f572be1d62c  /tmp/H2Orestart.oxt" | sha256sum -c - && \
-    unopkg add --shared --suppress-license /tmp/H2Orestart.oxt && \
+    (unopkg add --shared --suppress-license /tmp/H2Orestart.oxt || echo "WARNING: H2Orestart install failed; .hwp/.hwpx conversion will not work") && \
     rm -f /tmp/H2Orestart.oxt
 
 WORKDIR /app
@@ -19,9 +22,9 @@ ENV UV_PYTHON_PREFERENCE=only-system \
     UV_NO_PYTHON_DOWNLOADS=1 \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 COPY src ./src
-RUN uv sync --no-dev
+RUN uv sync --frozen --no-dev
 
 ENV HEALTH_SERVER_HOST=127.0.0.1 HEALTH_SERVER_PORT=3001
 HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
