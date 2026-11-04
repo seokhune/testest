@@ -71,3 +71,18 @@ class HwpReviewOutput(pydantic.BaseModel):
     report_file: DriveFileInfo
     stats: dict[str, int]
     summary: str
+
+
+class PdfReviewInput(pydantic.BaseModel):
+    file_name: str
+    output_parent_id: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+class PdfReviewOutput(pydantic.BaseModel):
+    source_title: str
+    corrected_file: DriveFileInfo
+    report_file: DriveFileInfo
+    stats: dict[str, int]
+    summary: str
