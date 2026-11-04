@@ -116,10 +116,20 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
 
     fake_parse.edit_calls = []
 
+    @sdk_workflows.activity(name="pdf-build-inplace")
+    async def fake_build_inplace(
+        source: DriveFileInfo,
+        body_edits: list[TextEdit],
+        hanja_translations: list[HanjaTranslation],
+    ) -> tuple[str, int] | None:
+        docx_bytes = _docx_bytes_from_paragraphs(["원본 양식 문단입니다."])
+        return base64.b64encode(docx_bytes).decode(), 1
+
     monkeypatch.setattr(review_module, "find_pdf_file", fake_find_pdf_file)
     monkeypatch.setattr(review_module, "read_pdf_text", fake_read_pdf_text)
     monkeypatch.setattr(review_module, "upload_drive_file", fake_upload_drive_file)
     monkeypatch.setattr(review_module, "chat_parse_to_model", fake_parse)
+    monkeypatch.setattr(review_module, "build_inplace_edition", fake_build_inplace)
 
     async with create_test_worker(
         temporal_env,
@@ -128,6 +138,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
             fake_find_pdf_file,
             fake_read_pdf_text,
             fake_upload_drive_file,
+            fake_build_inplace,
             review_module.proofread_body,
             review_module.translate_hanja_blocks,
             review_module.build_output_docx,
@@ -152,4 +163,55 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     assert uploaded == [
         "조선사_p8-15_교정본.docx",
         "조선사_p8-15_검수리포트.docx",
+        "조선사_p8-15_수정반영본.docx",
     ]
+    assert output.inplace_file is not None
+    assert "수정반영본에 1건" in output.summary
+
+
+def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:
+    import io
+
+    from docx import Document
+
+    document = Document()
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_apply_edits_by_text_replaces_and_appends() -> None:
+    from worker.workflows.hwp_review_docx import apply_edits_by_text
+
+    docx_bytes = _docx_bytes_from_paragraphs(
+        ["머리글 문단입니다.", "태조원년에 개국하였다. 子曰學而時習之。", "끝 문단입니다."]
+    )
+    edits = [
+        TextEdit(
+            item_id="p1",
+            original="태조원년에 개국하였다. 子曰學而時習之。",
+            revised="태조 원년에 개국하였다. 子曰學而時習之。",
+            category="spacing",
+            reason="띄어쓰기",
+        )
+    ]
+    translations = [
+        HanjaTranslation(
+            item_id="p1",
+            original="태조원년에 개국하였다. 子曰學而時習之。",
+            translation="공자가 말하기를, 배우고 때로 익히면 즐겁다.",
+        )
+    ]
+    result, applied = apply_edits_by_text(docx_bytes, edits, translations)
+    assert applied == 1
+
+    import io
+
+    from docx import Document
+
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+    assert "태조 원년에 개국하였다. 子曰學而時習之。" in texts
+    assert "번역: 공자가 말하기를, 배우고 때로 익히면 즐겁다." in texts

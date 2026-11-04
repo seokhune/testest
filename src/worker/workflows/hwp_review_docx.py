@@ -406,3 +406,62 @@ def assign_pages_from_pdf(block_texts: list[str], page_texts: list[str]) -> list
         last_page = _page_at(found)
         pages.append(last_page)
     return pages
+
+
+def apply_edits_by_text(
+    docx_bytes: bytes,
+    body_edits: list[TextEdit],
+    hanja_translations: list[HanjaTranslation],
+) -> tuple[bytes, int]:
+    """텍스트 매칭으로 문단을 찾아 교정/한문 번역을 그 자리에 반영한다.
+
+    PDF에서 변환한 DOCX는 원본 문단 구조와 블록 순서가 어긋날 수 있어
+    항목 ID 대신 원문 텍스트 일치로 문단을 찾는다. 반환값은 (결과 bytes,
+    반영된 교정 수).
+    """
+    from docx import Document
+
+    def _norm(text: str) -> str:
+        return "".join(text.split())
+
+    document = Document(io.BytesIO(docx_bytes))
+    paragraphs = [p for p in document.element.body.iter(_w("p")) if _element_text(p).strip()]
+    translated: set[int] = set()
+
+    for translation in hanja_translations:
+        needle = _norm(translation.original)
+        for i, paragraph in enumerate(paragraphs):
+            text = _norm(_element_text(paragraph))
+            if i in translated:
+                continue
+            if text == needle or (needle and text.startswith(needle[:60])):
+                translated_p = etree.Element(_w("p"))
+                run = etree.SubElement(translated_p, _w("r"))
+                t = etree.SubElement(run, _w("t"))
+                t.set(f"{{{XML_NS}}}space", "preserve")
+                t.text = f"번역: {translation.translation}"
+                paragraph.addnext(translated_p)
+                translated.add(i)
+                break
+
+    applied = 0
+    used: set[int] = set()
+    for edit in body_edits:
+        needle = _norm(edit.original)
+        match_index = None
+        exact = {i: _norm(_element_text(p)) for i, p in enumerate(paragraphs)}
+        for i, text in exact.items():
+            if i in used:
+                continue
+            if text == needle or (needle and text.startswith(needle[:60])):
+                match_index = i
+                break
+        if match_index is None:
+            continue
+        _replace_paragraph_text(paragraphs[match_index], edit.revised)
+        used.add(match_index)
+        applied += 1
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue(), applied

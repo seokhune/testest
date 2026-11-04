@@ -9,6 +9,7 @@ class DriveFileInfo(pydantic.BaseModel):
     parent_id: str | None = None
     mime_type: str | None = None
     view_url: str | None = None
+    file_size: int | None = None
 
 
 class BodyBlock(pydantic.BaseModel):
@@ -84,5 +85,6 @@ class PdfReviewOutput(pydantic.BaseModel):
     source_title: str
     corrected_file: DriveFileInfo
     report_file: DriveFileInfo
+    inplace_file: DriveFileInfo | None = None
     stats: dict[str, int]
     summary: str

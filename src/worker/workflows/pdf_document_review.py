@@ -37,13 +37,19 @@ from worker.workflows.hwp_review_models import (
     PdfReviewOutput,
     TextEdit,
 )
-from worker.workflows.hwp_review_docx import contains_hanja
+from worker.workflows.hwp_review_docx import (
+    apply_edits_by_text,
+    contains_hanja,
+    convert_pdf_to_docx,
+)
 
 REVIEW_MODEL = "mistral-medium-latest"
 LLM_CHUNK_SIZE = 8
 LLM_TIMEOUT = timedelta(seconds=300)
 IO_TIMEOUT = timedelta(seconds=120)
+CONVERT_TIMEOUT = timedelta(minutes=10)
 MAX_TEXT_CHARS = 1_900_000
+MAX_TRANSFER_RAW_BYTES = 1_500_000
 
 drive = connector("google_drive_mcp")
 
@@ -201,6 +207,7 @@ async def find_pdf_file(
         parent_id=file.get("parent_id"),
         mime_type=file.get("mime_type"),
         view_url=file.get("view_url"),
+        file_size=int(file.get("file_size") or 0) or None,
     )
 
 
@@ -296,6 +303,46 @@ async def build_output_docx(
 
 
 @workflows.activity(
+    name="pdf-build-inplace", start_to_close_timeout=CONVERT_TIMEOUT
+)
+async def build_inplace_edition(
+    source: DriveFileInfo,
+    body_edits: list[TextEdit],
+    hanja_translations: list[HanjaTranslation],
+    client: ToolCallClient = Depends(drive),
+) -> tuple[str, int] | None:
+    """원본 PDF 양식을 유지한 수정반영본을 만든다.
+
+    PDF 바이너리를 받아야 해서 커넥터 전송 한도(base64 2MB) 이내일 때만
+    가능하다. 한도를 넘거나 변환에 실패하면 None을 반환해 워크플로우가
+    계속 진행되도록 한다.
+    """
+    import asyncio
+    import base64
+
+    size = source.file_size or 0
+    if size and size > MAX_TRANSFER_RAW_BYTES:
+        return None
+    result = await client.call_tool(
+        tool_name="download_file_content",
+        arguments={"file_id": source.file_id},
+    )
+    value = _tool_result_value(result)
+    content = value.get("content") if isinstance(value, dict) else value
+    if not content:
+        return None
+    try:
+        pdf_bytes = base64.b64decode(content)
+        docx_bytes = await asyncio.to_thread(convert_pdf_to_docx, pdf_bytes)
+        edited, applied = await asyncio.to_thread(
+            apply_edits_by_text, docx_bytes, body_edits, hanja_translations
+        )
+    except Exception:
+        return None
+    return base64.b64encode(edited).decode(), applied
+
+
+@workflows.activity(
     name="pdf-upload-drive-file",
     start_to_close_timeout=IO_TIMEOUT,
     retry_policy_max_attempts=1,
@@ -362,6 +409,20 @@ class PdfDocumentReviewWorkflow:
             f"{stem}{range_suffix}_검수리포트.docx", report_b64, output_parent_id
         )
 
+        inplace_file = None
+        inplace_result = await build_inplace_edition(
+            source, body_edits, hanja_translations
+        )
+        inplace_note = ""
+        if inplace_result is not None:
+            inplace_b64, applied = inplace_result
+            inplace_file = await upload_drive_file(
+                f"{stem}{range_suffix}_수정반영본.docx",
+                inplace_b64,
+                output_parent_id,
+            )
+            inplace_note = f" 원본 양식 수정반영본에 {applied}건을 반영했습니다."
+
         page_note = ""
         if range_suffix:
             page_note = (
@@ -384,6 +445,7 @@ class PdfDocumentReviewWorkflow:
             source_title=source.title,
             corrected_file=corrected,
             report_file=report,
+            inplace_file=inplace_file,
             stats=stats,
-            summary=summary,
+            summary=summary + inplace_note,
         )
