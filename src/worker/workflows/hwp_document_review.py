@@ -37,6 +37,7 @@ from worker.workflows.hwp_review_docx import (
     PDF_EXTENSION,
     apply_review_edits,
     build_report_docx,
+    contains_hanja,
     convert_docx_to_pdf,
     convert_hancom_to_docx,
     convert_pdf_to_docx,
@@ -117,7 +118,9 @@ async def find_drive_file(
         tool_name="search_files",
         arguments={"query": f"title contains '{file_name}'", "page_size": 25},
     )
-    files = _tool_result_value(result) or []
+    value = _tool_result_value(result)
+    files = value.get("files") if isinstance(value, dict) else value
+    files = files or []
     candidates = [
         file
         for file in files
