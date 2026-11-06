@@ -28,6 +28,8 @@ from worker.workflows.hwp_review_models import (
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
+WPS_NS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+VML_NS = "urn:schemas-microsoft-com:vml"
 FOOTNOTES_RELTYPE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
 )
@@ -520,6 +522,8 @@ def apply_edits_by_text(
     한문 번역은 본문을 건드리지 않고 리포트에서만 다룬다.
     반환값은 (결과 bytes, 반영된 교정 수).
     """
+    import difflib
+
     from docx import Document
 
     def _norm(text: str) -> str:
@@ -544,6 +548,17 @@ def apply_edits_by_text(
                 match_index = i
                 break
         if match_index is None:
+            continue
+        paragraph_text = _element_text(paragraphs[match_index])
+        matcher = difflib.SequenceMatcher(
+            None, paragraph_text, edit.revised, autojunk=False
+        )
+        deleted = sum(
+            i2 - i1
+            for tag, i1, i2, _j1, _j2 in matcher.get_opcodes()
+            if tag in ("delete", "replace")
+        )
+        if deleted > max(30, int(len(paragraph_text) * 0.3)):
             continue
         _apply_text_edit(paragraphs[match_index], edit.revised)
         used.add(match_index)
@@ -655,6 +670,55 @@ def append_review_report(
             document.add_paragraph(f"번역: {translation.translation}")
     if not has_content:
         document.add_paragraph("한문 번역 대상이 없습니다.")
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def unwrap_text_frames(docx_bytes: bytes) -> bytes:
+    """떠 있는 텍스트 프레임/표를 본문 흐름으로 풀어 모든 내용이 보이게 한다.
+
+    pdf2docx는 위치가 있는 내용(예: 페이지 하단 주석)을 프레임으로
+    만드는데, 일부 뷰어는 프레임을 화면에서 덜어버려 주석이 사라진
+    것처럼 보인다. 프레임 위치 속성만 제거하고 문단/글자 서식은
+    그대로 유지한다.
+    """
+    import io
+
+    from docx import Document
+
+    document = Document(io.BytesIO(docx_bytes))
+    body = document.element.body
+
+    moved_something = False
+    for frame_paragraph in list(body.iter(_w("p"))):
+        text_boxes = list(frame_paragraph.iter(f"{{{WPS_NS}}}txbx"))
+        text_boxes += list(frame_paragraph.iter(f"{{{VML_NS}}}textbox"))
+        if not text_boxes:
+            continue
+        parent = frame_paragraph.getparent()
+        if parent is None:
+            continue
+        insert_at = parent.index(frame_paragraph)
+        moved = 0
+        for text_box in text_boxes:
+            for content in text_box.findall(f"{{{W_NS}}}txbxContent"):
+                for inner in list(content):
+                    if inner.tag in (_w("p"), _w("tbl")):
+                        parent.insert(insert_at + moved, inner)
+                        moved += 1
+        if moved:
+            parent.remove(frame_paragraph)
+            moved_something = True
+
+    for frame_pr in list(body.iter(_w("framePr"))):
+        frame_pr.getparent().remove(frame_pr)
+        moved_something = True
+
+    for table_position in list(body.iter(_w("tblpPr"))):
+        table_position.getparent().remove(table_position)
+        moved_something = True
 
     buffer = io.BytesIO()
     document.save(buffer)

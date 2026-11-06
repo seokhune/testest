@@ -219,6 +219,62 @@ def test_build_structured_docx_preserves_pages_and_applies_edits() -> None:
     assert "고려 태조 원년의 기사다." in texts
 
 
+def test_unwrap_text_frames_keeps_footnote_text() -> None:
+    import io
+
+    from docx import Document
+    from docx.oxml.ns import qn
+    from worker.workflows.hwp_review_docx import unwrap_text_frames
+
+    document = Document()
+    document.add_paragraph("본문 문단입니다.")
+    footnote = document.add_paragraph("1) 주석 인용문입니다.")
+    footnote_paragraph = footnote._p
+    frame_pr = footnote_paragraph.get_or_add_pPr().makeelement(
+        qn("w:framePr"), {}
+    )
+    footnote_paragraph.get_or_add_pPr().append(frame_pr)
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    result = unwrap_text_frames(buffer.getvalue())
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+    assert "본문 문단입니다." in texts
+    assert "1) 주석 인용문입니다." in texts
+    assert all(
+        p._p.find(qn("w:pPr")) is None
+        or p._p.find(qn("w:pPr")).find(qn("w:framePr")) is None
+        for p in document.paragraphs
+    )
+
+
+def test_apply_edits_skips_large_deletions() -> None:
+    from worker.workflows.hwp_review_docx import apply_edits_by_text
+
+    docx_bytes = _docx_bytes_from_paragraphs(
+        ["본문 문단입니다. 1) 주석 인용문이 여기에 길게 이어집니다. 2) 또 다른 주석입니다."]
+    )
+    edits = [
+        TextEdit(
+            item_id="p0",
+            original="본문 문단입니다. 1) 주석 인용문이 여기에 길게 이어집니다. 2) 또 다른 주석입니다.",
+            revised="본문 문단입니다.",  # 주석을 통째로 지우는 교정
+            category="style",
+            reason="삭제 시도",
+        )
+    ]
+    result, applied = apply_edits_by_text(docx_bytes, edits, [])
+    assert applied == 0
+
+    import io
+
+    from docx import Document
+
+    document = Document(io.BytesIO(result))
+    assert "주석 인용문" in document.paragraphs[0].text
+
+
 def test_append_review_report_groups_by_year() -> None:
     from worker.workflows.hwp_review_docx import append_review_report
 
