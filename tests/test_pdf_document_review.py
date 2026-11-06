@@ -134,6 +134,63 @@ def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:
     return buffer.getvalue()
 
 
+def test_insert_year_summaries_places_block_at_year_ends() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.pdf_document_review import insert_year_summaries
+
+    document = Document()
+    document.add_paragraph("태조 19년(임신) 정월에 하왕이 즉위하였다.")
+    document.add_paragraph("하왕이 폐세자를 서인으로 보내였다.")
+    document.add_paragraph("태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다.")
+    document.add_paragraph("태종이 하륜을 문하부에 보내였다.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    sections = [
+        (
+            "태조 19년(임신)",
+            [
+                TextEdit(
+                    item_id="p1",
+                    original="하왕이 폐세자를 서인으로 보내였다.",
+                    revised="하왕이 폐세자를 서인으로 보내었다.",
+                    category="typo",
+                    reason="어미 교정",
+                )
+            ],
+            [],
+            [],
+            [],
+        ),
+        (
+            "태조 20년(계유)",
+            [
+                TextEdit(
+                    item_id="p3",
+                    original="태종이 하륜을 문하부에 보내였다.",
+                    revised="태종이 하륜을 문하부에 보내었다.",
+                    category="typo",
+                    reason="어미 교정",
+                )
+            ],
+            [],
+            [],
+            [],
+        ),
+    ]
+    result = insert_year_summaries(buffer.getvalue(), sections)
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+
+    assert "〔태조 19년(임신) 검수 정리〕" in texts
+    assert "〔태조 20년(계유) 검수 정리〕" in texts
+    # 19년 정리는 20년 제목 직전에 위치해야 한다
+    assert texts.index("〔태조 19년(임신) 검수 정리〕") < texts.index("태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다.")
+    assert texts.index("〔태조 20년(계유) 검수 정리〕") > texts.index("태종이 하륜을 문하부에 보내였다.")
+
+
 def test_apply_edits_by_text_preserves_formatting() -> None:
     import io
 

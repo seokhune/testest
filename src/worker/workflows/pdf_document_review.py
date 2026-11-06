@@ -175,6 +175,104 @@ def group_by_year(
     return sections
 
 
+def insert_year_summaries(docx_bytes: bytes, year_sections: list) -> bytes:
+    """각 연도 구간이 끝나는 지점에 그 연도의 검수 정리를 삽입한다.
+
+    본문 문단 중 연도 표기(예: '태조 19년')로 시작하는 문단을 찾아, 다음
+    연도가 시작되기 직전에 이전 연도의 수정 내역 정리를 끼워 넣는다.
+    마지막 연도의 정리는 본문 끝에 추가한다. 삽입되는 문단은 굵은 제목과
+    목록 형태로, 본문 원고 자체는 건드리지 않는다.
+    """
+    import io
+
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    def _normalize(item, model_class):
+        if isinstance(item, model_class):
+            return item
+        return model_class.model_validate(item)
+
+    sections = []
+    for section in year_sections:
+        year = section[0]
+        edits = [_normalize(item, TextEdit) for item in section[1]]
+        translations = [_normalize(item, HanjaTranslation) for item in section[2]]
+        diffs = [_normalize(item, BodyFootnoteDifference) for item in section[3]]
+        annotations = [_normalize(item, SourceAnnotation) for item in section[4]]
+        sections.append((year, edits, translations, diffs, annotations))
+
+    summaries = {
+        year: (edits, translations, diffs, annotations)
+        for year, edits, translations, diffs, annotations in sections
+        if edits or translations or diffs or annotations
+    }
+    if not summaries:
+        return docx_bytes
+
+    document = Document(io.BytesIO(docx_bytes))
+    body = document.element.body
+
+    def _make_summary(section):
+        year, edits, translations, diffs, annotations = section
+        made = []
+        paragraph = document.add_paragraph()
+        paragraph.add_run(f"〔{year} 검수 정리〕").bold = True
+        made.append(paragraph)
+        paragraph = document.add_paragraph()
+        paragraph.add_run(
+            f"교정 {len(edits)}건 · 한문 번역 {len(translations)}건 · "
+            f"본문-주석 인용 차이 {len(diffs)}건 · 주석 출처 보완 제안 {len(annotations)}건"
+        )
+        made.append(paragraph)
+        for edit in edits:
+            paragraph = document.add_paragraph()
+            paragraph.add_run(f"· ({edit.category}) {edit.reason}")
+            made.append(paragraph)
+            paragraph = document.add_paragraph()
+            paragraph.add_run(f"  원문: {edit.original}")
+            made.append(paragraph)
+            paragraph = document.add_paragraph()
+            paragraph.add_run(f"  수정: {edit.revised}")
+            made.append(paragraph)
+        return made
+
+    ordered_years = [section[0] for section in sections if section[0] in summaries]
+    seen: set[str] = set()
+    positions: list[tuple[str, object]] = []
+    for paragraph in body.iter(qn("w:p")):
+        text = "".join(t.text or "" for t in paragraph.iter(qn("w:t")))
+        year = detect_year(text)
+        if year in summaries and year not in seen and text.strip().startswith(year[:2]):
+            seen.add(year)
+            positions.append((year, paragraph))
+        if len(seen) == len(summaries):
+            break
+
+    inserted_ranges: list[tuple[str, list]] = []
+    for year, _paragraph in positions:
+        section = next(s for s in sections if s[0] == year)
+        inserted_ranges.append((year, _make_summary(section)))
+
+    # 다음 연도 제목 직전에 이전 연도 정리 삽입
+    for index in range(len(inserted_ranges) - 1):
+        _year, made = inserted_ranges[index]
+        _next_year, next_paragraph = positions[index + 1]
+        for paragraph in made:
+            next_paragraph.addprevious(paragraph._p)
+    # 마지막 연도 정리는 본문 끝(sectPr 직전)에 삽입
+    if inserted_ranges:
+        _year, made = inserted_ranges[-1]
+        section_properties = body.find(qn("w:sectPr"))
+        anchor = section_properties if section_properties is not None else body[-1]
+        for paragraph in made:
+            anchor.addprevious(paragraph._p)
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
 def _norm_text(text: str) -> str:
     return "".join(text.split())
 
@@ -590,6 +688,7 @@ async def build_result_docx(
             build_structured_docx, pages, blocks, body_edits, hanja_translations
         )
 
+    edited = await asyncio.to_thread(insert_year_summaries, edited, year_sections)
     final = await asyncio.to_thread(
         append_review_report, edited, source.title, year_sections, stats
     )
