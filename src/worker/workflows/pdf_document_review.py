@@ -366,15 +366,15 @@ MAX_EDITS = 100
 MAX_TRANSLATIONS = 100
 MAX_DIFFERENCES = 50
 MAX_ANNOTATIONS = 100
-MAX_TEXT_CHARS = 5000
+MAX_ITEM_CHARS = 5000
 
 
 def _cap_edits(edits: list) -> list:
     return [
         edit.model_copy(
             update={
-                "original": edit.original[:MAX_TEXT_CHARS],
-                "revised": edit.revised[:MAX_TEXT_CHARS],
+                "original": edit.original[:MAX_ITEM_CHARS],
+                "revised": edit.revised[:MAX_ITEM_CHARS],
             }
         )
         for edit in edits[:MAX_EDITS]
@@ -385,8 +385,8 @@ def _cap_translations(items: list) -> list:
     return [
         item.model_copy(
             update={
-                "original": item.original[:MAX_TEXT_CHARS],
-                "translation": item.translation[:MAX_TEXT_CHARS],
+                "original": item.original[:MAX_ITEM_CHARS],
+                "translation": item.translation[:MAX_ITEM_CHARS],
             }
         )
         for item in items[:MAX_TRANSLATIONS]
@@ -395,14 +395,14 @@ def _cap_translations(items: list) -> list:
 
 def _cap_differences(items: list) -> list:
     return [
-        item.model_copy(update={"difference": item.difference[:MAX_TEXT_CHARS]})
+        item.model_copy(update={"difference": item.difference[:MAX_ITEM_CHARS]})
         for item in items[:MAX_DIFFERENCES]
     ]
 
 
 def _cap_annotations(items: list) -> list:
     return [
-        item.model_copy(update={"source": item.source[:MAX_TEXT_CHARS]})
+        item.model_copy(update={"source": item.source[:MAX_ITEM_CHARS]})
         for item in items[:MAX_ANNOTATIONS]
     ]
 
