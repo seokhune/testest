@@ -362,6 +362,16 @@ QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문 
 """
 
 
+def _log_llm_failure(pass_name: str, error: Exception) -> None:
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "LLM 응답 파싱 실패(%s), 해당 청크 건너뜀: %s",
+        pass_name,
+        str(error)[:500],
+    )
+
+
 async def _parse(model_class: type, prompt: str) -> Any:
     request = ChatCompletionRequest(
         model=REVIEW_MODEL,
@@ -434,8 +444,11 @@ async def proofread_body(blocks: list[BodyBlock]) -> list[TextEdit]:
     edits: list[TextEdit] = []
     for chunk in _chunk(blocks, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
-        result = await _parse(_EditBatch, BODY_PROOFREAD_PROMPT + listing)
-        edits.extend(result.edits)
+        try:
+            result = await _parse(_EditBatch, BODY_PROOFREAD_PROMPT + listing)
+            edits.extend(result.edits)
+        except Exception as error:
+            _log_llm_failure("본문 교정", error)
     return edits
 
 
@@ -445,8 +458,11 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
     translations: list[HanjaTranslation] = []
     for chunk in _chunk(targets, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
-        result = await _parse(_HanjaBatch, HANJA_TRANSLATE_PROMPT + listing)
-        translations.extend(result.translations)
+        try:
+            result = await _parse(_HanjaBatch, HANJA_TRANSLATE_PROMPT + listing)
+            translations.extend(result.translations)
+        except Exception as error:
+            _log_llm_failure("한문 번역", error)
     return translations
 
 
@@ -455,8 +471,11 @@ async def annotate_source_titles(blocks: list[BodyBlock]) -> list[TextEdit]:
     edits: list[TextEdit] = []
     for chunk in _chunk(blocks, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
-        result = await _parse(_EditBatch, SOURCE_TITLE_PROMPT + listing)
-        edits.extend(result.edits)
+        try:
+            result = await _parse(_EditBatch, SOURCE_TITLE_PROMPT + listing)
+            edits.extend(result.edits)
+        except Exception as error:
+            _log_llm_failure("서지명 표기", error)
     return edits
 
 
@@ -465,8 +484,11 @@ async def compare_quotes(blocks: list[BodyBlock]) -> list[BodyFootnoteDifference
     differences: list[BodyFootnoteDifference] = []
     for chunk in _chunk(blocks, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
-        result = await _parse(_DifferenceBatch, QUOTE_DIFFERENCE_PROMPT + listing)
-        differences.extend(result.differences)
+        try:
+            result = await _parse(_DifferenceBatch, QUOTE_DIFFERENCE_PROMPT + listing)
+            differences.extend(result.differences)
+        except Exception as error:
+            _log_llm_failure("본문-주석 비교", error)
     return differences
 
 
@@ -475,8 +497,11 @@ async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnot
     annotations: list[SourceAnnotation] = []
     for chunk in _chunk(blocks, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
-        result = await _parse(_SourceBatch, FOOTNOTE_SOURCE_PROMPT + listing)
-        annotations.extend(result.annotations)
+        try:
+            result = await _parse(_SourceBatch, FOOTNOTE_SOURCE_PROMPT + listing)
+            annotations.extend(result.annotations)
+        except Exception as error:
+            _log_llm_failure("주석 출처 판독", error)
     return annotations
 
 
