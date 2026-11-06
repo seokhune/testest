@@ -362,6 +362,51 @@ QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문 
 """
 
 
+MAX_EDITS = 100
+MAX_TRANSLATIONS = 100
+MAX_DIFFERENCES = 50
+MAX_ANNOTATIONS = 100
+MAX_TEXT_CHARS = 5000
+
+
+def _cap_edits(edits: list) -> list:
+    return [
+        edit.model_copy(
+            update={
+                "original": edit.original[:MAX_TEXT_CHARS],
+                "revised": edit.revised[:MAX_TEXT_CHARS],
+            }
+        )
+        for edit in edits[:MAX_EDITS]
+    ]
+
+
+def _cap_translations(items: list) -> list:
+    return [
+        item.model_copy(
+            update={
+                "original": item.original[:MAX_TEXT_CHARS],
+                "translation": item.translation[:MAX_TEXT_CHARS],
+            }
+        )
+        for item in items[:MAX_TRANSLATIONS]
+    ]
+
+
+def _cap_differences(items: list) -> list:
+    return [
+        item.model_copy(update={"difference": item.difference[:MAX_TEXT_CHARS]})
+        for item in items[:MAX_DIFFERENCES]
+    ]
+
+
+def _cap_annotations(items: list) -> list:
+    return [
+        item.model_copy(update={"source": item.source[:MAX_TEXT_CHARS]})
+        for item in items[:MAX_ANNOTATIONS]
+    ]
+
+
 def _log_llm_failure(pass_name: str, error: Exception) -> None:
     import logging
 
@@ -449,7 +494,7 @@ async def proofread_body(blocks: list[BodyBlock]) -> list[TextEdit]:
             edits.extend(result.edits)
         except Exception as error:
             _log_llm_failure("본문 교정", error)
-    return edits
+    return _cap_edits(edits)
 
 
 @workflows.activity(name="pdf-translate-hanja", start_to_close_timeout=LLM_TIMEOUT)
@@ -463,7 +508,7 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
             translations.extend(result.translations)
         except Exception as error:
             _log_llm_failure("한문 번역", error)
-    return translations
+    return _cap_translations(translations)
 
 
 @workflows.activity(name="pdf-annotate-source-titles", start_to_close_timeout=LLM_TIMEOUT)
@@ -476,7 +521,7 @@ async def annotate_source_titles(blocks: list[BodyBlock]) -> list[TextEdit]:
             edits.extend(result.edits)
         except Exception as error:
             _log_llm_failure("서지명 표기", error)
-    return edits
+    return _cap_edits(edits)
 
 
 @workflows.activity(name="pdf-compare-quotes", start_to_close_timeout=LLM_TIMEOUT)
@@ -489,7 +534,7 @@ async def compare_quotes(blocks: list[BodyBlock]) -> list[BodyFootnoteDifference
             differences.extend(result.differences)
         except Exception as error:
             _log_llm_failure("본문-주석 비교", error)
-    return differences
+    return _cap_differences(differences)
 
 
 @workflows.activity(name="pdf-annotate-footnote-sources", start_to_close_timeout=LLM_TIMEOUT)
@@ -502,7 +547,7 @@ async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnot
             annotations.extend(result.annotations)
         except Exception as error:
             _log_llm_failure("주석 출처 판독", error)
-    return annotations
+    return _cap_annotations(annotations)
 
 
 @workflows.activity(name="pdf-build-result", start_to_close_timeout=CONVERT_TIMEOUT)
