@@ -121,6 +121,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
         source: DriveFileInfo,
         pages: list[tuple[int, str]],
         blocks: list,
+        total_pages: int,
         body_edits: list[TextEdit],
         hanja_translations: list[HanjaTranslation],
     ) -> tuple[str, int]:

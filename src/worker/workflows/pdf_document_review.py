@@ -320,42 +320,47 @@ async def build_inplace_edition(
     source: DriveFileInfo,
     pages: list[tuple[int, str]],
     blocks: list[BodyBlock],
+    total_pages: int,
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
     client: ToolCallClient = Depends(drive),
 ) -> tuple[str, int]:
-    """원본 양식/구조를 유지한 수정반영본을 만든다.
+    """원본 PDF 양식을 그대로 유지한 수정반영본을 만든다.
 
-    파일이 커넥터 전송 한도(base64 2MB) 이내면 원본 PDF를 pdf2docx로
-    변환해 완전한 원본 양식에 교정을 반영한다. 한도를 넘으면 원본
-    페이지 구조(쪽 표식·순서)를 재구성한 DOCX에 교정을 반영한다.
-    어떤 경우든 사용자가 파일을 나눌 필요는 없다.
+    다운로드→변환→교정을 한 액티비티 안에서 처리하고 작은 DOCX만
+    반환한다(액티비티 결과가 base64 2MB 이벤트 한도를 넘지 않게).
+    검수 범위에 해당하는 물리 페이지만 pdf2docx로 변환한다. 변환에
+    실패하면 원본 페이지 구조를 재구성한 DOCX로 대체한다.
     """
     import asyncio
     import base64
 
-    size = source.file_size or 0
-    if not size or size <= MAX_TRANSFER_RAW_BYTES:
+    try:
         result = await client.call_tool(
             tool_name="download_file_content",
             arguments={"file_id": source.file_id},
         )
         value = _tool_result_value(result)
         content = value.get("content") if isinstance(value, dict) else value
-        if content:
-            try:
-                pdf_bytes = base64.b64decode(content)
-                docx_bytes = await asyncio.to_thread(convert_pdf_to_docx, pdf_bytes)
-                edited, applied = await asyncio.to_thread(
-                    apply_edits_by_text, docx_bytes, body_edits, hanja_translations
-                )
-                return base64.b64encode(edited).decode(), applied
-            except Exception as error:
-                import logging
+        if not content:
+            raise RuntimeError("PDF 다운로드 결과가 비었습니다")
+        pdf_bytes = base64.b64decode(content)
 
-                logging.getLogger(__name__).warning(
-                    "원본 양식 변환 실패, 구조 재구성으로 대체: %s", error
-                )
+        start = (pages[0][0] - 1) if pages else 0
+        end = pages[-1][0] if pages else None
+        docx_bytes = await asyncio.to_thread(
+            convert_pdf_to_docx, pdf_bytes, start, end
+        )
+        edited, applied = await asyncio.to_thread(
+            apply_edits_by_text, docx_bytes, body_edits, hanja_translations, blocks
+        )
+        return base64.b64encode(edited).decode(), applied
+    except Exception as error:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "원본 양식 변환 실패, 구조 재구성으로 대체: %s", error
+        )
     edited, applied = await asyncio.to_thread(
         build_structured_docx, pages, blocks, body_edits, hanja_translations
     )
@@ -434,7 +439,7 @@ class PdfDocumentReviewWorkflow:
         )
 
         inplace_b64, applied = await build_inplace_edition(
-            source, pages, blocks, body_edits, hanja_translations
+            source, pages, blocks, total_pages, body_edits, hanja_translations
         )
         inplace_file = await upload_drive_file(
             f"{stem}{range_suffix}_수정반영본.docx",

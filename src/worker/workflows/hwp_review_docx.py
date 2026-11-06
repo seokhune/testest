@@ -360,8 +360,14 @@ def convert_docx_to_pdf(docx_bytes: bytes) -> bytes:
     return _soffice_convert(docx_bytes, "source.docx", "pdf")
 
 
-def convert_pdf_to_docx(pdf_bytes: bytes) -> bytes:
-    """PDF를 양식을 보존하는 DOCX로 변환한다 (pdf2docx 기반)."""
+def convert_pdf_to_docx(
+    pdf_bytes: bytes, start: int | None = None, end: int | None = None
+) -> bytes:
+    """PDF를 양식을 보존하는 DOCX로 변환한다 (pdf2docx 기반).
+
+    start/end는 0-기반 물리 페이지 인덱스이며 end는 제외(end=None이면
+    문서 끝까지). 지정하면 해당 페이지만 변환해 결과 크기를 줄인다.
+    """
     from pdf2docx import Converter
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -371,7 +377,7 @@ def convert_pdf_to_docx(pdf_bytes: bytes) -> bytes:
         output_path = tmp / "source.docx"
         converter = Converter(str(source_path))
         try:
-            converter.convert(str(output_path))
+            converter.convert(str(output_path), start=start or 0, end=end)
         finally:
             converter.close()
         if output_path.exists() and output_path.stat().st_size > 0:
@@ -436,6 +442,7 @@ def apply_edits_by_text(
     docx_bytes: bytes,
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
+    blocks: list | None = None,
 ) -> tuple[bytes, int]:
     """텍스트 매칭으로 문단을 찾아 교정/한문 번역을 그 자리에 반영한다.
 
@@ -452,8 +459,10 @@ def apply_edits_by_text(
     paragraphs = [p for p in document.element.body.iter(_w("p")) if _element_text(p).strip()]
     translated: set[int] = set()
 
+    block_text_by_id = {block.block_id: block.text for block in blocks} if blocks else {}
+
     for translation in hanja_translations:
-        needle = _norm(translation.original)
+        needle = _norm(block_text_by_id.get(translation.item_id) or translation.original)
         for i, paragraph in enumerate(paragraphs):
             text = _norm(_element_text(paragraph))
             if i in translated:
@@ -471,7 +480,7 @@ def apply_edits_by_text(
     applied = 0
     used: set[int] = set()
     for edit in body_edits:
-        needle = _norm(edit.original)
+        needle = _norm(block_text_by_id.get(edit.item_id) or edit.original)
         match_index = None
         exact = {i: _norm(_element_text(p)) for i, p in enumerate(paragraphs)}
         for i, text in exact.items():
