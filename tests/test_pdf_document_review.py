@@ -387,11 +387,10 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     @sdk_workflows.activity(name="pdf-build-result")
     async def fake_build_result(
         source: DriveFileInfo,
-        pages: list[tuple[int, str]],
+        first_page: int,
+        last_page: int,
         blocks: list,
         total_pages: int,
-        body_edits: list[TextEdit],
-        hanja_translations: list[HanjaTranslation],
         year_sections: list,
         stats: dict,
     ) -> str:

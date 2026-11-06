@@ -213,6 +213,12 @@ def group_by_year(
     return sections
 
 
+def _normalize_section_item(item, model_class):
+    if isinstance(item, model_class):
+        return item
+    return model_class.model_validate(item)
+
+
 def _norm_for_match(text: str) -> str:
     return "".join(text.split())
 
@@ -516,12 +522,12 @@ QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문 
 """
 
 
-MAX_EDITS = 60
-MAX_TRANSLATIONS = 60
-MAX_DIFFERENCES = 30
-MAX_ANNOTATIONS = 60
-MAX_ITEM_CHARS = 1500
-MAX_HEADING_CHARS = 300
+MAX_EDITS = 40
+MAX_TRANSLATIONS = 40
+MAX_DIFFERENCES = 20
+MAX_ANNOTATIONS = 40
+MAX_ITEM_CHARS = 500
+MAX_HEADING_CHARS = 200
 
 
 def _cap_edits(edits: list) -> list:
@@ -738,12 +744,11 @@ async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnot
 @workflows.activity(name="pdf-build-result", start_to_close_timeout=CONVERT_TIMEOUT)
 async def build_result_docx(
     source: DriveFileInfo,
-    pages: list[tuple[int, str]],
+    first_page: int,
+    last_page: int,
     blocks: list[BodyBlock],
     total_pages: int,
-    body_edits: list[TextEdit],
-    hanja_translations: list[HanjaTranslation],
-    year_sections: list[tuple],
+    year_sections: list,
     stats: dict[str, int],
     client: ToolCallClient = Depends(drive),
 ) -> str:
@@ -758,6 +763,21 @@ async def build_result_docx(
     import asyncio
     import base64
 
+    # 년도 구간에서 평탄한 교정/번역 목록을 다시 만든다(중복 전달 제거)
+    flat_edits = [
+        _normalize_section_item(item, TextEdit)
+        for section in year_sections
+        for item in section["edits"]
+    ]
+    flat_translations = [
+        _normalize_section_item(item, HanjaTranslation)
+        for section in year_sections
+        for item in section["translations"]
+    ]
+    pages_for_fallback = [
+        (block.page, block.text) for block in blocks
+    ]
+
     try:
         result = await client.call_tool(
             tool_name="download_file_content",
@@ -769,14 +789,14 @@ async def build_result_docx(
             raise RuntimeError("PDF 다운로드 결과가 비었습니다")
         pdf_bytes = base64.b64decode(content)
 
-        start = (pages[0][0] - 1) if pages else 0
-        end = pages[-1][0] if pages else None
+        start = first_page - 1
+        end = last_page or None
         docx_bytes = await asyncio.to_thread(
             convert_pdf_to_docx, pdf_bytes, start, end
         )
         docx_bytes = await asyncio.to_thread(unwrap_text_frames, docx_bytes)
         edited, _applied = await asyncio.to_thread(
-            apply_edits_by_text, docx_bytes, body_edits, hanja_translations, blocks
+            apply_edits_by_text, docx_bytes, flat_edits, flat_translations, blocks
         )
     except Exception as error:
         import logging
@@ -785,7 +805,7 @@ async def build_result_docx(
             "원본 양식 변환 실패, 구조 재구성으로 대체: %s", error
         )
         edited, _applied = await asyncio.to_thread(
-            build_structured_docx, pages, blocks, body_edits, hanja_translations
+            build_structured_docx, pages_for_fallback, blocks, flat_edits, flat_translations
         )
 
     final = await asyncio.to_thread(insert_year_reports, edited, year_sections)
@@ -889,11 +909,10 @@ class PdfDocumentReviewWorkflow:
 
         result_b64 = await _guarded("결과 문서 생성", build_result_docx(
             source,
-            pages,
+            pages[0][0] if pages else 1,
+            pages[-1][0] if pages else total_pages,
             blocks,
             total_pages,
-            body_edits,
-            hanja_translations,
             year_sections,
             stats,
         ))
