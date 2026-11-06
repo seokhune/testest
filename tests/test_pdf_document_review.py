@@ -93,11 +93,19 @@ def test_group_by_year_buckets_edits() -> None:
     translations = [
         HanjaTranslation(item_id="p0", original="漢文", translation="한문 번역"),
     ]
-    sections = group_by_year(blocks, edits, translations)
-    assert [year for year, _, _ in sections] == ["태종 6년(무인)", "태종 7년(기묘)"]
+    from worker.workflows.hwp_review_models import BodyFootnoteDifference
+
+    differences = [
+        BodyFootnoteDifference(
+            body_block_id="p3", footnote_id="5", difference="인용 문구가 다르다"
+        )
+    ]
+    sections = group_by_year(blocks, edits, translations, differences)
+    assert [year for year, _, _, _ in sections] == ["태종 6년(무인)", "태종 7년(기묘)"]
     assert [e.item_id for e in sections[0][1]] == ["p1"]
     assert [t.item_id for t in sections[0][2]] == ["p0"]
     assert [e.item_id for e in sections[1][1]] == ["p3"]
+    assert [d.footnote_id for d in sections[1][3]] == ["5"]
 
 
 def test_reconcile_edits_remaps_invented_ids() -> None:
@@ -279,11 +287,18 @@ def test_append_review_report_groups_by_year() -> None:
     from worker.workflows.hwp_review_docx import append_review_report
 
     docx_bytes = _docx_bytes_from_paragraphs(["본문 문단입니다."])
+    from worker.workflows.hwp_review_models import BodyFootnoteDifference
+
     sections = [
         (
             "태종 6년(무인)",
             [TextEdit(item_id="p1", original="원문", revised="수정", category="typo", reason="사유")],
             [HanjaTranslation(item_id="p1", original="漢文", translation="번역")],
+            [
+                BodyFootnoteDifference(
+                    body_block_id="p1", footnote_id="2", difference="본문과 주석 인용이 다르다"
+                )
+            ],
         ),
     ]
     result = append_review_report(
@@ -301,6 +316,7 @@ def test_append_review_report_groups_by_year() -> None:
     assert "태종 6년(무인)" in texts
     assert "수정: 수정" in texts
     assert "번역: 번역" in texts
+    assert "[주석 2] 본문과 주석 인용이 다르다" in texts
 
 
 async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None:
@@ -340,8 +356,18 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
         docx_bytes = _docx_bytes_from_paragraphs(["결과 문단입니다."])
         return base64.b64encode(docx_bytes).decode()
 
+    @sdk_workflows.activity(name="pdf-annotate-source-titles")
+    async def fake_annotate_source_titles(blocks: list) -> list:
+        return []
+
+    @sdk_workflows.activity(name="pdf-compare-quotes")
+    async def fake_compare_quotes(blocks: list) -> list:
+        return []
+
     async def fake_parse(model_class, request):
         prompt = request.messages[-1].content
+        if model_class is review_module._DifferenceBatch:
+            return review_module._DifferenceBatch(differences=[])
         if model_class is review_module._EditBatch:
             if fake_parse.edit_calls:
                 return review_module._EditBatch(edits=[])
@@ -364,6 +390,8 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
 
     monkeypatch.setattr(review_module, "find_pdf_file", fake_find_pdf_file)
     monkeypatch.setattr(review_module, "read_pdf_text", fake_read_pdf_text)
+    monkeypatch.setattr(review_module, "annotate_source_titles", fake_annotate_source_titles)
+    monkeypatch.setattr(review_module, "compare_quotes", fake_compare_quotes)
     monkeypatch.setattr(review_module, "upload_drive_file", fake_upload_drive_file)
     monkeypatch.setattr(review_module, "chat_parse_to_model", fake_parse)
     monkeypatch.setattr(review_module, "build_result_docx", fake_build_result)
@@ -376,6 +404,8 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
             fake_read_pdf_text,
             fake_upload_drive_file,
             fake_build_result,
+            fake_annotate_source_titles,
+            fake_compare_quotes,
             review_module.proofread_body,
             review_module.translate_hanja_blocks,
         ],
@@ -396,4 +426,5 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     assert output.stats["body_paragraphs"] == 16
     assert output.stats["body_edits"] == 1
     assert "8~15페이지" in output.summary
+    assert "인용 차이" in output.summary
     assert uploaded == ["조선사_p8-15_검수결과.docx"]
