@@ -188,6 +188,65 @@ def group_by_year(
     return sections
 
 
+def _norm_text(text: str) -> str:
+    return "".join(text.split())
+
+
+def reconcile_edits(
+    blocks: list[BodyBlock], edits: list[TextEdit]
+) -> list[TextEdit]:
+    """LLM 교정 항목을 블록에 정합한다.
+
+    LLM이 실제 블록과 다른 item_id를 붙일 수 있어, item_id가 없으면
+    원문 텍스트 일치로 블록을 찾아 id를 다시 매긴다. 매칭 실패 항목은
+    버리고, 같은 블록에 여러 항목이 있으면 마지막 것을 유지한다.
+    """
+    by_id = {block.block_id: block for block in blocks}
+    by_text = {_norm_text(block.text): block for block in blocks}
+    matched: dict[str, TextEdit] = {}
+    for edit in edits:
+        block = by_id.get(edit.item_id)
+        if block is None:
+            block = by_text.get(_norm_text(edit.original))
+        if block is None:
+            needle = _norm_text(edit.original)[:60]
+            if needle:
+                for candidate in blocks:
+                    if _norm_text(candidate.text).startswith(needle):
+                        block = candidate
+                        break
+        if block is None:
+            continue
+        matched[block.block_id] = edit.model_copy(update={"item_id": block.block_id})
+    return list(matched.values())
+
+
+def reconcile_translations(
+    blocks: list[BodyBlock], translations: list[HanjaTranslation]
+) -> list[HanjaTranslation]:
+    """LLM 한문 번역 항목을 블록에 정합한다 (reconcile_edits와 같은 규칙)."""
+    by_id = {block.block_id: block for block in blocks}
+    by_text = {_norm_text(block.text): block for block in blocks}
+    matched: dict[str, HanjaTranslation] = {}
+    for translation in translations:
+        block = by_id.get(translation.item_id)
+        if block is None:
+            block = by_text.get(_norm_text(translation.original))
+        if block is None:
+            needle = _norm_text(translation.original)[:60]
+            if needle:
+                for candidate in blocks:
+                    if _norm_text(candidate.text).startswith(needle):
+                        block = candidate
+                        break
+        if block is None:
+            continue
+        matched[block.block_id] = translation.model_copy(
+            update={"item_id": block.block_id}
+        )
+    return list(matched.values())
+
+
 class _EditBatch(pydantic.BaseModel):
     edits: list[TextEdit]
 
@@ -422,6 +481,8 @@ class PdfDocumentReviewWorkflow:
         body_edits = await proofread_body(blocks)
         hanja_translations = await translate_hanja_blocks(blocks)
 
+        body_edits = reconcile_edits(blocks, body_edits)
+        hanja_translations = reconcile_translations(blocks, hanja_translations)
         year_sections = group_by_year(blocks, body_edits, hanja_translations)
         stats = {
             "body_paragraphs": len(blocks),

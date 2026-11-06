@@ -100,6 +100,36 @@ def test_group_by_year_buckets_edits() -> None:
     assert [e.item_id for e in sections[1][1]] == ["p3"]
 
 
+def test_reconcile_edits_remaps_invented_ids() -> None:
+    from worker.workflows.hwp_review_models import BodyBlock
+    from worker.workflows.pdf_document_review import reconcile_edits
+
+    blocks = [
+        BodyBlock(block_id="p0", text="태종 6년(무인) 봄 정월에", page=8),
+        BodyBlock(block_id="p1", text="김첨을 의정부에 보내았다.", page=8),
+    ]
+    edits = [
+        TextEdit(
+            item_id="p12",
+            original="김첨을 의정부에 보내았다.",
+            revised="김첨을 의정부에 보내었다.",
+            category="typo",
+            reason="어미 교정",
+        ),
+        TextEdit(
+            item_id="p99",
+            original="매칭 안 되는 문장",
+            revised="무시된다",
+            category="typo",
+            reason="r",
+        ),
+    ]
+    result = reconcile_edits(blocks, edits)
+    assert len(result) == 1
+    assert result[0].item_id == "p1"
+    assert result[0].revised == "김첨을 의정부에 보내었다."
+
+
 def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:
     import io
 
