@@ -34,23 +34,25 @@ def make_pdf_text() -> str:
     return "\n".join(parts)
 
 
-def test_blocks_from_pages_splits_paragraphs() -> None:
+def test_blocks_from_pages_merges_lines_into_paragraphs() -> None:
     from worker.workflows.pdf_document_review import blocks_from_pages
 
     pages = [
-        (8, "첫 문단입니다.\n\n둘째 문단입니다."),
-        (9, "한 줄\n두 번째 줄\n세 번째 줄"),
+        (
+            8,
+            "태조 19년(임신) 정월에 하왕이\n즉위하였다.\n하왕이 폐세자를 서인으로\n보내였다.\n1) <보기> 인용문이다.",
+        ),
+        (9, "- 9 -\n한 문장입니다."),
     ]
     blocks = blocks_from_pages(pages)
     assert [(b.page, b.text) for b in blocks] == [
-        (8, "첫 문단입니다."),
-        (8, "둘째 문단입니다."),
-        (9, "한 줄"),
-        (9, "두 번째 줄"),
-        (9, "세 번째 줄"),
+        (8, "태조 19년(임신) 정월에 하왕이 즉위하였다."),
+        (8, "하왕이 폐세자를 서인으로 보내였다."),
+        (8, "1) <보기> 인용문이다."),
+        (9, "한 문장입니다."),
     ]
     assert blocks[0].block_id == "p0"
-    assert blocks[4].block_id == "p4"
+    assert blocks[3].block_id == "p3"
 
 
 def test_detect_year_reads_reign_year_headings() -> None:
@@ -65,7 +67,7 @@ def test_group_by_year_buckets_edits() -> None:
 
     blocks = [
         BodyBlock(block_id="p0", text="태종 6년(무인) 봄 정월에 초하루 병술에", page=8),
-        BodyBlock(block_id="p1", text="김첨이를 의정부에 보내았다.", page=8),
+        BodyBlock(block_id="p1", text="김첨을 의정부에 보내았다.", page=8),
         BodyBlock(block_id="p2", text="태종 7년(기묘) 가을에", page=9),
         BodyBlock(block_id="p3", text="하륜이 상서하였다.", page=9),
     ]
@@ -84,11 +86,15 @@ def test_group_by_year_buckets_edits() -> None:
         )
     ]
     sections = group_by_year(blocks, edits, translations, differences)
-    assert [year for year, *_ in sections] == ["태종 6년(무인)", "태종 7년(기묘)"]
-    assert [e.item_id for e in sections[0][1]] == ["p1"]
-    assert [t.item_id for t in sections[0][2]] == ["p0"]
-    assert [e.item_id for e in sections[1][1]] == ["p3"]
-    assert [d.footnote_id for d in sections[1][3]] == ["5"]
+    assert [section["year"] for section in sections] == [
+        "태종 6년(무인)",
+        "태종 7년(기묘)",
+    ]
+    assert sections[0]["heading"].startswith("태종 6년(무인)")
+    assert [e.item_id for e in sections[0]["edits"]] == ["p1"]
+    assert [t.item_id for t in sections[0]["translations"]] == ["p0"]
+    assert [e.item_id for e in sections[1]["edits"]] == ["p3"]
+    assert [d.footnote_id for d in sections[1]["differences"]] == ["5"]
 
 
 def test_reconcile_edits_remaps_invented_ids() -> None:
@@ -150,9 +156,10 @@ def test_insert_year_reports_places_full_report_at_year_ends() -> None:
     document.save(buffer)
 
     sections = [
-        (
-            "태조 19년(임신)",
-            [
+        {
+            "year": "태조 19년(임신)",
+            "heading": "태조 19년(임신) 정월에 하왕이 즉위하였다.",
+            "edits": [
                 TextEdit(
                     item_id="p1",
                     original="하왕이 폐세자를 서인으로 보내였다.",
@@ -161,21 +168,22 @@ def test_insert_year_reports_places_full_report_at_year_ends() -> None:
                     reason="어미 교정",
                 )
             ],
-            [
+            "translations": [
                 HanjaTranslation(
                     item_id="p0", original="漢文 주석", translation="한문 번역문"
                 )
             ],
-            [
+            "differences": [
                 BodyFootnoteDifference(
                     body_block_id="p1", footnote_id="2", difference="인용 불일치"
                 )
             ],
-            [],
-        ),
-        (
-            "태조 20년(계유)",
-            [
+            "annotations": [],
+        },
+        {
+            "year": "태조 20년(계유)",
+            "heading": "태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다.",
+            "edits": [
                 TextEdit(
                     item_id="p3",
                     original="태종이 하륜을 문하부에 보내였다.",
@@ -184,10 +192,10 @@ def test_insert_year_reports_places_full_report_at_year_ends() -> None:
                     reason="어미 교정",
                 )
             ],
-            [],
-            [],
-            [],
-        ),
+            "translations": [],
+            "differences": [],
+            "annotations": [],
+        },
     ]
     result = insert_year_reports(buffer.getvalue(), sections)
     document = Document(io.BytesIO(result))

@@ -85,18 +85,48 @@ def _chunk(items: list, size: int) -> list[list]:
     return [items[start : start + size] for start in range(0, len(items), size)]
 
 
-def blocks_from_pages(pages: list[tuple[int, str]]) -> list[BodyBlock]:
-    """물리 페이지 텍스트에서 문단 블록을 만든다.
+SENTENCE_ENDINGS = (".", "?", "!", "。")
+FOOTNOTE_LINE_RE = re.compile(r"^\d{1,3}\)")
 
-    pypdf 추출 텍스트는 빈 줄 없이 개행만 있는 경우가 많아, 빈 줄로 나눈
-    결과가 하나뿐이면 개행 기준으로 문단을 나눈다.
+
+def _paragraphs_from_lines(lines: list[str]) -> list[str]:
+    """pypdf의 줄 단위 텍스트를 문단으로 병합한다.
+
+    문장 끝(./?/!/(。))에서 문단을 끊고, 각주 번호(1), 2) 등)로 시작하는
+    줄은 자체 문단으로 분리한다. 연도 제목이 줄바꿈으로 잘리는 것도 이
+    병합으로 하나의 문단으로 합쳐진다.
     """
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        if PAGE_MARKER_RE.match(stripped):
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        if FOOTNOTE_LINE_RE.match(stripped) and current:
+            paragraphs.append(" ".join(current))
+            current = []
+        current.append(stripped)
+        if stripped.endswith(SENTENCE_ENDINGS) or FOOTNOTE_LINE_RE.match(stripped):
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return paragraphs
+
+
+def blocks_from_pages(pages: list[tuple[int, str]]) -> list[BodyBlock]:
+    """물리 페이지 텍스트에서 문단 블록을 만든다."""
     blocks: list[BodyBlock] = []
     for number, text in pages:
-        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        if len(parts) <= 1 and "\n" in text:
-            parts = [line.strip() for line in text.split("\n") if line.strip()]
-        for part in parts:
+        for part in _paragraphs_from_lines(text.split("\n")):
             blocks.append(
                 BodyBlock(block_id=f"p{len(blocks)}", text=part, page=number)
             )
@@ -122,9 +152,13 @@ def group_by_year(
     hanja_translations: list[HanjaTranslation],
     differences: list[BodyFootnoteDifference] | None = None,
     source_annotations: list[SourceAnnotation] | None = None,
-) -> list[tuple]:
-    """블록 순서대로 년도 구간을 따라가며 검수 결과를 년도별로 묶는다."""
-    sections: list[tuple] = []
+) -> list[dict]:
+    """블록 순서대로 년도 구간을 따라가며 검수 결과를 년도별로 묶는다.
+
+    각 구간은 {year, heading, edits, translations, differences, annotations}
+    dict로, heading은 그 구간을 시작한 문단의 텍스트다.
+    """
+    sections: list[dict] = []
     current = "기타"
     edits_by_block: dict[str, list[TextEdit]] = {}
     for edit in body_edits:
@@ -142,56 +176,102 @@ def group_by_year(
         annotations_by_block.setdefault(annotation.item_id, []).append(annotation)
     section_index: dict[str, int] = {}
 
-    def section_for(label: str) -> int:
+    def section_for(label: str) -> dict:
         if label not in section_index:
             section_index[label] = len(sections)
-            sections.append((label, [], [], [], []))
-        return section_index[label]
+            sections.append(
+                {
+                    "year": label,
+                    "heading": "",
+                    "edits": [],
+                    "translations": [],
+                    "differences": [],
+                    "annotations": [],
+                }
+            )
+        return sections[section_index[label]]
 
     for block in blocks:
         year = detect_year(block.text)
         if year:
             current = year
-        index = section_for(current)
-        edits, translations, diffs, annotations = (
-            sections[index][1],
-            sections[index][2],
-            sections[index][3],
-            sections[index][4],
-        )
-        edits.extend(edits_by_block.get(block.block_id, []))
-        translations.extend(translations_by_block.get(block.block_id, []))
-        diffs.extend(differences_by_block.pop(block.block_id, []))
-        annotations.extend(annotations_by_block.pop(block.block_id, []))
+        section = section_for(current)
+        if year and not section["heading"]:
+            section["heading"] = block.text
+        section["edits"].extend(edits_by_block.get(block.block_id, []))
+        section["translations"].extend(translations_by_block.get(block.block_id, []))
+        section["differences"].extend(differences_by_block.pop(block.block_id, []))
+        section["annotations"].extend(annotations_by_block.pop(block.block_id, []))
     if differences_by_block:
-        index = section_for("기타")
+        section = section_for("기타")
         for leftover in differences_by_block.values():
-            sections[index][3].extend(leftover)
+            section["differences"].extend(leftover)
     if annotations_by_block:
-        index = section_for("기타")
+        section = section_for("기타")
         for leftover in annotations_by_block.values():
-            sections[index][4].extend(leftover)
+            section["annotations"].extend(leftover)
     return sections
 
 
-def _year_key(label: str) -> str:
-    match = re.search(r"(\d{1,3})\s*년", label)
-    if match:
-        return match.group(1)
-    if "원년" in label:
-        return "원년"
-    return label
+def _norm_for_match(text: str) -> str:
+    return "".join(text.split())
+
+
+def _year_reports(section: dict) -> list:
+    year = section["year"]
+    edits = section["edits"]
+    translations = section["translations"]
+    diffs = section["differences"]
+    annotations = section["annotations"]
+    lines = [
+        f"〔{year} 검수 리포트〕",
+        (
+            f"교정 {len(edits)}건 · 한문 번역 {len(translations)}건 · "
+            f"본문-주석 인용 차이 {len(diffs)}건 · 주석 출처 보완 제안 {len(annotations)}건"
+        ),
+        "1) 교정 내역",
+    ]
+    if edits:
+        for edit in edits:
+            lines.append(f"· ({edit.category}) {edit.reason}")
+            lines.append(f"  원문: {edit.original}")
+            lines.append(f"  수정: {edit.revised}")
+    else:
+        lines.append("수정된 문단이 없습니다.")
+    lines.append("2) 한문 번역")
+    if translations:
+        for translation in translations:
+            lines.append(f"· 원문: {translation.original}")
+            lines.append(f"  번역: {translation.translation}")
+    else:
+        lines.append("한문 번역 대상이 없습니다.")
+    lines.append("3) 본문-주석 인용 차이")
+    if diffs:
+        for difference in diffs:
+            lines.append(
+                f"· [주석 {difference.footnote_id or '-'}] {difference.difference}"
+            )
+    else:
+        lines.append("본문-주석 인용 차이가 없습니다.")
+    lines.append("4) 주석 출처 보완 제안")
+    if annotations:
+        for annotation in annotations:
+            lines.append(f"· [주석 {annotation.item_id}] 출처: {annotation.source}")
+    else:
+        lines.append("주석 출처 보완 대상이 없습니다.")
+    return lines
 
 
 def insert_year_reports(docx_bytes: bytes, year_sections: list) -> bytes:
-    """각 연도 구간의 내용이 모두 끝나는 지점(다음 연도 시작 직전)에
+    """각 연도 구간의 내용이 모두 끝나는 지점(다음 연도 제목 직전)에
     그 연도의 검수 리포트 전체를 삽입한다.
 
-    연도 경계를 찾지 못한 구간의 리포트는 내용 유실을 막기 위해
-    본문 끝에 순서대로 추가한다. 삽입되는 문단은 굵은 제목과 목록
-    형태이며, 원고 본문 자체는 건드리지 않는다.
+    경계는 정규식이 아니라 다음 연도 구간의 제목 문단 텍스트(heading)를
+    변환된 문서의 문단에서 내용으로 찾아 정한다. 찾지 못한 구간의
+    리포트는 내용 유실을 막기 위해 본문 끝에 순서대로 추가한다.
     """
     import io
+    import logging
 
     from docx import Document
     from docx.oxml.ns import qn
@@ -203,108 +283,89 @@ def insert_year_reports(docx_bytes: bytes, year_sections: list) -> bytes:
 
     sections = []
     for section in year_sections:
-        year = section[0]
-        edits = [_normalize(item, TextEdit) for item in section[1]]
-        translations = [_normalize(item, HanjaTranslation) for item in section[2]]
-        diffs = [_normalize(item, BodyFootnoteDifference) for item in section[3]]
-        annotations = [_normalize(item, SourceAnnotation) for item in section[4]]
-        sections.append((year, edits, translations, diffs, annotations))
+        normalized = {
+            "year": section["year"],
+            "heading": section.get("heading") or "",
+            "edits": [_normalize(item, TextEdit) for item in section["edits"]],
+            "translations": [
+                _normalize(item, HanjaTranslation) for item in section["translations"]
+            ],
+            "differences": [
+                _normalize(item, BodyFootnoteDifference)
+                for item in section["differences"]
+            ],
+            "annotations": [
+                _normalize(item, SourceAnnotation) for item in section["annotations"]
+            ],
+        }
+        sections.append(normalized)
 
     content_sections = [
         section
         for section in sections
-        if section[1] or section[2] or section[3] or section[4]
+        if section["edits"]
+        or section["translations"]
+        or section["differences"]
+        or section["annotations"]
     ]
     if not content_sections:
         return docx_bytes
 
     document = Document(io.BytesIO(docx_bytes))
     body = document.element.body
+    paragraphs = list(body.iter(qn("w:p")))
+    paragraph_texts = [
+        _norm_for_match("".join(t.text or "" for t in p.iter(qn("w:t"))))
+        for p in paragraphs
+    ]
 
-    def _paragraph_text(paragraph) -> str:
-        return "".join(t.text or "" for t in paragraph.iter(qn("w:t")))
+    def _find_heading_position(heading: str, start: int) -> int:
+        needle = _norm_for_match(heading)[:24]
+        if len(needle) < 6:
+            return -1
+        for index in range(start, len(paragraphs)):
+            if needle in paragraph_texts[index]:
+                return index
+        return -1
 
-    def _make_report(section) -> list:
-        year, edits, translations, diffs, annotations = section
-        made = []
+    # 각 구간의 제목 문단 위치를 내용 매칭으로 찾는다
+    positions: list[int] = []
+    search_from = 0
+    for section in content_sections:
+        position = _find_heading_position(section["heading"], search_from)
+        positions.append(position)
+        if position >= 0:
+            search_from = position + 1
 
-        def _add(text: str, bold: bool = False) -> None:
-            paragraph = document.add_paragraph()
-            run = paragraph.add_run(text)
-            if bold:
-                run.bold = True
-            made.append(paragraph)
-
-        _add(f"〔{year} 검수 리포트〕", bold=True)
-        _add(
-            f"교정 {len(edits)}건 · 한문 번역 {len(translations)}건 · "
-            f"본문-주석 인용 차이 {len(diffs)}건 · 주석 출처 보완 제안 {len(annotations)}건"
-        )
-        _add("1) 교정 내역", bold=True)
-        if edits:
-            for edit in edits:
-                _add(f"· ({edit.category}) {edit.reason}")
-                _add(f"  원문: {edit.original}")
-                _add(f"  수정: {edit.revised}")
-        else:
-            _add("수정된 문단이 없습니다.")
-        _add("2) 한문 번역", bold=True)
-        if translations:
-            for translation in translations:
-                _add(f"· 원문: {translation.original}")
-                _add(f"  번역: {translation.translation}")
-        else:
-            _add("한문 번역 대상이 없습니다.")
-        _add("3) 본문-주석 인용 차이", bold=True)
-        if diffs:
-            for difference in diffs:
-                _add(f"· [주석 {difference.footnote_id or '-'}] {difference.difference}")
-        else:
-            _add("본문-주석 인용 차이가 없습니다.")
-        _add("4) 주석 출처 보완 제안", bold=True)
-        if annotations:
-            for annotation in annotations:
-                _add(f"· [주석 {annotation.item_id}] 출처: {annotation.source}")
-        else:
-            _add("주석 출처 보완 대상이 없습니다.")
-        return made
-
-    # 연도 경계를 문서 순서대로 찾는다 (라벨이 아니라 순서+연도 번호로 매칭)
-    boundaries: list[tuple[int, object]] = []
-    expected = 0
-    for paragraph in body.iter(qn("w:p")):
-        if expected >= len(content_sections):
-            break
-        text = _paragraph_text(paragraph)
-        detected = detect_year(text)
-        if detected is None:
-            continue
-        match = YEAR_RE.search(text[:60])
-        if match is None or match.start() > 20:
-            continue
-        if _year_key(detected) == _year_key(content_sections[expected][0]):
-            boundaries.append((expected, paragraph))
-            expected += 1
-
-    # 경계 k의 문단 직전에 이전 연도(k-1)의 리포트를 삽입한다
+    # 구간 k의 리포트는 구간 k+1의 제목 문단 직전에 삽입된다
     placed: set[int] = set()
-    for index, boundary_paragraph in boundaries:
-        if index == 0:
+    for index in range(len(content_sections) - 1):
+        next_position = positions[index + 1]
+        if next_position < 0:
             continue
-        made = _make_report(content_sections[index - 1])
-        for paragraph in made:
-            boundary_paragraph.addprevious(paragraph._p)
-        placed.add(index - 1)
+        report_lines = _year_reports(content_sections[index])
+        anchor_paragraph = paragraphs[next_position]
+        for line in report_lines:
+            paragraph = document.add_paragraph(line)
+            anchor_paragraph.addprevious(paragraph._p)
+        placed.add(index)
 
-    # 경계를 못 찾았거나 마지막 연도의 리포트는 본문 끝에 순서대로 추가
+    matched = sum(1 for index in range(len(content_sections) - 1) if index in placed)
+    logging.getLogger(__name__).info(
+        "연도 경계 매칭: %d/%d (제목 미발견 구간은 본문 끝에 추가)",
+        matched,
+        len(content_sections) - 1,
+    )
+
+    # 첫 구간과 경로를 찾지 못한 구간의 리포트는 본문 끝에 순서대로 추가
     anchor = body.find(qn("w:sectPr"))
     if anchor is None:
         anchor = body[-1]
     for index, section in enumerate(content_sections):
         if index in placed:
             continue
-        for paragraph in _make_report(section):
-            anchor.addprevious(paragraph._p)
+        for line in _year_reports(section):
+            anchor.addprevious(document.add_paragraph(line)._p)
 
     buffer = io.BytesIO()
     document.save(buffer)
@@ -838,9 +899,12 @@ class PdfDocumentReviewWorkflow:
                 f"{data.page_start or 1}~{data.page_end or total_pages}페이지)"
             )
         year_note = " · ".join(
-            year
-            for year, edits, translations, diffs, annotations in year_sections
-            if edits or translations or diffs or annotations
+            section["year"]
+            for section in year_sections
+            if section["edits"]
+            or section["translations"]
+            or section["differences"]
+            or section["annotations"]
         )
         summary = (
             f"본문 {len(blocks)}문단을 검수해{page_note} "
