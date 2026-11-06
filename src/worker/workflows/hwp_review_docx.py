@@ -621,8 +621,8 @@ def append_review_report(
 ) -> bytes:
     """검수 결과 DOCX 끝에 리포트 섹션을 추가한다.
 
-    year_sections는 (년도 라벨, 교정 목록, 한문 번역 목록, 인용 차이 목록)
-    튜플 목록이다.
+    year_sections는 (년도 라벨, 교정 목록, 한문 번역 목록, 인용 차이 목록,
+    주석 출처 보완 목록) 튜플 목록이다.
     """
     import io
 
@@ -647,7 +647,7 @@ def append_review_report(
 
     document.add_heading("2. 년도별 교정 내역", level=2)
     has_content = False
-    for year, edits, _translations, _diffs in year_sections:
+    for year, edits, _translations, _diffs, _anns in year_sections:
         if not edits:
             continue
         has_content = True
@@ -661,7 +661,7 @@ def append_review_report(
 
     document.add_heading("3. 년도별 한문 번역", level=2)
     has_content = False
-    for year, _edits, translations, _diffs in year_sections:
+    for year, _edits, translations, _diffs, _anns in year_sections:
         if not translations:
             continue
         has_content = True
@@ -674,7 +674,7 @@ def append_review_report(
 
     document.add_heading("4. 년도별 본문-주석 인용 차이", level=2)
     has_content = False
-    for year, _edits, _translations, diffs in year_sections:
+    for year, _edits, _translations, diffs, _anns in year_sections:
         if not diffs:
             continue
         has_content = True
@@ -686,6 +686,18 @@ def append_review_report(
             )
     if not has_content:
         document.add_paragraph("본문-주석 인용 차이가 없습니다.")
+
+    document.add_heading("5. 년도별 주석 출처 보완 제안", level=2)
+    has_content = False
+    for year, _edits, _translations, _diffs, annotations in year_sections:
+        if not annotations:
+            continue
+        has_content = True
+        document.add_heading(year, level=3)
+        for annotation in annotations:
+            document.add_paragraph(f"[주석 {annotation.item_id}] 출처: {annotation.source}")
+    if not has_content:
+        document.add_paragraph("주석 출처 보완 대상이 없습니다.")
 
     buffer = io.BytesIO()
     document.save(buffer)

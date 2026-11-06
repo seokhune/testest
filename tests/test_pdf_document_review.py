@@ -101,7 +101,7 @@ def test_group_by_year_buckets_edits() -> None:
         )
     ]
     sections = group_by_year(blocks, edits, translations, differences)
-    assert [year for year, _, _, _ in sections] == ["태종 6년(무인)", "태종 7년(기묘)"]
+    assert [year for year, *_ in sections] == ["태종 6년(무인)", "태종 7년(기묘)"]
     assert [e.item_id for e in sections[0][1]] == ["p1"]
     assert [t.item_id for t in sections[0][2]] == ["p0"]
     assert [e.item_id for e in sections[1][1]] == ["p3"]
@@ -299,6 +299,7 @@ def test_append_review_report_groups_by_year() -> None:
                     body_block_id="p1", footnote_id="2", difference="본문과 주석 인용이 다르다"
                 )
             ],
+            [],
         ),
     ]
     result = append_review_report(
@@ -364,6 +365,10 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     async def fake_compare_quotes(blocks: list) -> list:
         return []
 
+    @sdk_workflows.activity(name="pdf-annotate-footnote-sources")
+    async def fake_annotate_footnote_sources(blocks: list) -> list:
+        return []
+
     async def fake_parse(model_class, request):
         prompt = request.messages[-1].content
         if model_class is review_module._DifferenceBatch:
@@ -392,6 +397,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     monkeypatch.setattr(review_module, "read_pdf_text", fake_read_pdf_text)
     monkeypatch.setattr(review_module, "annotate_source_titles", fake_annotate_source_titles)
     monkeypatch.setattr(review_module, "compare_quotes", fake_compare_quotes)
+    monkeypatch.setattr(review_module, "annotate_footnote_sources", fake_annotate_footnote_sources)
     monkeypatch.setattr(review_module, "upload_drive_file", fake_upload_drive_file)
     monkeypatch.setattr(review_module, "chat_parse_to_model", fake_parse)
     monkeypatch.setattr(review_module, "build_result_docx", fake_build_result)
@@ -406,6 +412,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
             fake_build_result,
             fake_annotate_source_titles,
             fake_compare_quotes,
+            fake_annotate_footnote_sources,
             review_module.proofread_body,
             review_module.translate_hanja_blocks,
         ],

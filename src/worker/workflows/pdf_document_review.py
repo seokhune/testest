@@ -36,6 +36,7 @@ from worker.workflows.hwp_review_models import (
     HanjaTranslation,
     PdfReviewInput,
     PdfReviewOutput,
+    SourceAnnotation,
     TextEdit,
 )
 from worker.workflows.hwp_review_docx import (
@@ -165,11 +166,10 @@ def group_by_year(
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
     differences: list[BodyFootnoteDifference] | None = None,
-) -> list[tuple[str, list[TextEdit], list[HanjaTranslation], list[BodyFootnoteDifference]]]:
-    """블록 순서대로 년도 구간을 따라가며 교정/번역/인용 차이를 년도별로 묶는다."""
-    sections: list[
-        tuple[str, list[TextEdit], list[HanjaTranslation], list[BodyFootnoteDifference]]
-    ] = []
+    source_annotations: list[SourceAnnotation] | None = None,
+) -> list[tuple]:
+    """블록 순서대로 년도 구간을 따라가며 검수 결과를 년도별로 묶는다."""
+    sections: list[tuple] = []
     current = "기타"
     edits_by_block: dict[str, list[TextEdit]] = {}
     for edit in body_edits:
@@ -182,12 +182,15 @@ def group_by_year(
         differences_by_block.setdefault(difference.body_block_id or "", []).append(
             difference
         )
+    annotations_by_block: dict[str, list[SourceAnnotation]] = {}
+    for annotation in source_annotations or []:
+        annotations_by_block.setdefault(annotation.item_id, []).append(annotation)
     section_index: dict[str, int] = {}
 
     def section_for(label: str) -> int:
         if label not in section_index:
             section_index[label] = len(sections)
-            sections.append((label, [], [], []))
+            sections.append((label, [], [], [], []))
         return section_index[label]
 
     for block in blocks:
@@ -195,18 +198,24 @@ def group_by_year(
         if year:
             current = year
         index = section_for(current)
-        edits, translations, diffs = (
+        edits, translations, diffs, annotations = (
             sections[index][1],
             sections[index][2],
             sections[index][3],
+            sections[index][4],
         )
         edits.extend(edits_by_block.get(block.block_id, []))
         translations.extend(translations_by_block.get(block.block_id, []))
         diffs.extend(differences_by_block.pop(block.block_id, []))
+        annotations.extend(annotations_by_block.pop(block.block_id, []))
     if differences_by_block:
         index = section_for("기타")
         for leftover in differences_by_block.values():
             sections[index][3].extend(leftover)
+    if annotations_by_block:
+        index = section_for("기타")
+        for leftover in annotations_by_block.values():
+            sections[index][4].extend(leftover)
     return sections
 
 
@@ -281,6 +290,10 @@ class _DifferenceBatch(pydantic.BaseModel):
     differences: list[BodyFootnoteDifference]
 
 
+class _SourceBatch(pydantic.BaseModel):
+    annotations: list[SourceAnnotation]
+
+
 BODY_PROOFREAD_PROMPT = """아래는 번역서 본문 문단 목록입니다.
 
 규칙:
@@ -316,6 +329,17 @@ SOURCE_TITLE_PROMPT = """아래는 번역서 문단 목록입니다. 주석의 �
 4. 주석 번호와 주석 인용문은 절대 삭제하지 마십시오.
 
 각 항목은 item_id(대괄호 안 문단 번호), original(원문 전체), revised(수정문 전체), category(book_title 고정), reason(변경 이유 한 문장)을 포함합니다.
+
+문단 목록:
+"""
+
+FOOTNOTE_SOURCE_PROMPT = """아래는 번역서 문단 목록입니다. 주석의 출처(서지 정보)를 확인하십시오.
+
+규칙:
+1. 주석에서 출처(저자, 책 제목, 판본 등)가 빠졌거나 불완전한 경우 보완 제안을 annotations에 포함하십시오.
+2. 출처가 완전하면 포함하지 마십시오. 해당 사항이 없으면 빈 목록을 반환하십시오.
+
+각 항목은 item_id(대괄호 안 문단 번호), source(보완할 출처 표기)을 포함합니다.
 
 문단 목록:
 """
@@ -440,6 +464,16 @@ async def compare_quotes(blocks: list[BodyBlock]) -> list[BodyFootnoteDifference
     return differences
 
 
+@workflows.activity(name="pdf-annotate-footnote-sources", start_to_close_timeout=LLM_TIMEOUT)
+async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnotation]:
+    annotations: list[SourceAnnotation] = []
+    for chunk in _chunk(blocks, LLM_CHUNK_SIZE):
+        listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
+        result = await _parse(_SourceBatch, FOOTNOTE_SOURCE_PROMPT + listing)
+        annotations.extend(result.annotations)
+    return annotations
+
+
 @workflows.activity(name="pdf-build-result", start_to_close_timeout=CONVERT_TIMEOUT)
 async def build_result_docx(
     source: DriveFileInfo,
@@ -553,10 +587,16 @@ class PdfDocumentReviewWorkflow:
         body_edits = await proofread_body(blocks)
         source_title_edits = await annotate_source_titles(blocks)
         hanja_translations = await translate_hanja_blocks(blocks)
+        source_annotations = await annotate_footnote_sources(blocks)
         differences = await compare_quotes(blocks)
 
         body_edits = reconcile_edits(blocks, body_edits + source_title_edits)
         hanja_translations = reconcile_translations(blocks, hanja_translations)
+        source_annotations = [
+            annotation
+            for annotation in source_annotations
+            if annotation.item_id in {block.block_id for block in blocks}
+        ]
         valid_ids = {block.block_id for block in blocks}
         differences = [
             difference
@@ -564,13 +604,14 @@ class PdfDocumentReviewWorkflow:
             if (difference.body_block_id or "") in valid_ids
         ]
         year_sections = group_by_year(
-            blocks, body_edits, hanja_translations, differences
+            blocks, body_edits, hanja_translations, differences, source_annotations
         )
         stats = {
             "body_paragraphs": len(blocks),
             "body_edits": len(body_edits),
             "hanja_translations": len(hanja_translations),
             "quote_differences": len(differences),
+            "source_annotations": len(source_annotations),
             "total_pages": total_pages,
             "page_start": data.page_start or 0,
             "page_end": data.page_end or 0,
@@ -605,13 +646,14 @@ class PdfDocumentReviewWorkflow:
             )
         year_note = " · ".join(
             year
-            for year, edits, translations, diffs in year_sections
-            if edits or translations or diffs
+            for year, edits, translations, diffs, annotations in year_sections
+            if edits or translations or diffs or annotations
         )
         summary = (
             f"본문 {len(blocks)}문단을 검수해{page_note} "
             f"{len(body_edits)}건을 교정하고 한문 번역 {len(hanja_translations)}건을 추가했으며, "
-            f"본문-주석 인용 차이 {len(differences)}건을 확인했습니다. "
+            f"본문-주석 인용 차이 {len(differences)}건과 주석 출처 보완 제안 "
+            f"{len(source_annotations)}건을 확인했습니다. "
             f"년도 구간: {year_note}"
         )
         return PdfReviewOutput(
