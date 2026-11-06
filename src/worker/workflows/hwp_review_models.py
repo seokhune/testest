@@ -34,6 +34,14 @@ class ExtractedDocument(pydantic.BaseModel):
 
 
 class TextEdit(pydantic.BaseModel):
+
+    @pydantic.field_validator("item_id", mode="before")
+    @classmethod
+    def _stringify_item_id(cls, value):
+        if isinstance(value, (int, float)):
+            return str(value)
+        return value
+
     item_id: str
     original: str
     revised: str
@@ -45,17 +53,45 @@ class SourceAnnotation(pydantic.BaseModel):
     item_id: str
     source: str
 
+    @pydantic.field_validator("item_id", mode="before")
+    @classmethod
+    def _stringify_item_id(cls, value):
+        if isinstance(value, (int, float)):
+            return str(value)
+        return value
+
 
 class HanjaTranslation(pydantic.BaseModel):
+
+    @pydantic.field_validator("item_id", mode="before")
+    @classmethod
+    def _stringify_item_id(cls, value):
+        if isinstance(value, (int, float)):
+            return str(value)
+        return value
+
     item_id: str
     original: str
     translation: str
+
+
+def _coerce_str(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
 
 
 class BodyFootnoteDifference(pydantic.BaseModel):
     body_block_id: str | None = None
     footnote_id: str | None = None
     difference: str
+
+    @pydantic.field_validator("body_block_id", "footnote_id", mode="before")
+    @classmethod
+    def _stringify_ids(cls, value):
+        return _coerce_str(value)
 
 
 class HwpReviewInput(pydantic.BaseModel):
