@@ -86,66 +86,22 @@ def _chunk(items: list, size: int) -> list[list]:
     return [items[start : start + size] for start in range(0, len(items), size)]
 
 
-def split_pdf_pages(text: str) -> list[tuple[int, str]]:
-    """PDF 텍스트를 페이지 표식(`- 12 -` 등) 기준으로 나눈다."""
-    pages: dict[int, list[str]] = {1: []}
-    current = 1
-    for line in text.splitlines():
-        marker = PAGE_MARKER_RE.match(line)
-        if marker:
-            current = int(marker.group(1))
-            pages.setdefault(current, [])
-        else:
-            pages.setdefault(current, []).append(line)
-    return [
-        (number, "\n".join(lines).strip())
-        for number, lines in sorted(pages.items())
-        if "\n".join(lines).strip()
-    ]
+def blocks_from_pages(pages: list[tuple[int, str]]) -> list[BodyBlock]:
+    """물리 페이지 텍스트에서 문단 블록을 만든다.
 
-
-def slice_pages(
-    text: str,
-    page_start: int | None = None,
-    page_end: int | None = None,
-) -> tuple[list[tuple[int, str]], int]:
-    """PDF 텍스트를 페이지 단위로 슬라이싱한다."""
-    pages = split_pdf_pages(text)
-    total_pages = max((number for number, _ in pages), default=1)
-    selected = pages
-    if page_start is not None or page_end is not None:
-        start = page_start or 1
-        end = page_end or total_pages
-        selected = [
-            (number, page_text) for number, page_text in pages if start <= number <= end
-        ]
-        if not selected:
-            raise workflows.WorkflowError(
-                f"지정한 페이지 범위({start}~{end})의 본문을 찾지 못했습니다. "
-                f"PDF에 페이지 표식(- 8 - 형태)이 있는지 확인해 주세요.",
-                non_retryable=True,
-            )
-    return selected, total_pages
-
-
-def extract_page_blocks(
-    text: str,
-    page_start: int | None = None,
-    page_end: int | None = None,
-) -> tuple[list[BodyBlock], int]:
-    """텍스트를 페이지별 문단 블록으로 나누고, 페이지 범위로 슬라이싱한다."""
-    selected, total_pages = slice_pages(text, page_start, page_end)
+    pypdf 추출 텍스트는 빈 줄 없이 개행만 있는 경우가 많아, 빈 줄로 나눈
+    결과가 하나뿐이면 개행 기준으로 문단을 나눈다.
+    """
     blocks: list[BodyBlock] = []
-    for page_number, page_text in selected:
-        for paragraph in re.split(r"\n\s*\n", page_text):
-            cleaned = paragraph.strip()
-            if cleaned:
-                blocks.append(
-                    BodyBlock(
-                        block_id=f"p{len(blocks)}", text=cleaned, page=page_number
-                    )
-                )
-    return blocks, total_pages
+    for number, text in pages:
+        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        if len(parts) <= 1 and "\n" in text:
+            parts = [line.strip() for line in text.split("\n") if line.strip()]
+        for part in parts:
+            blocks.append(
+                BodyBlock(block_id=f"p{len(blocks)}", text=part, page=number)
+            )
+    return blocks
 
 
 YEAR_RE = re.compile(r"\d{1,3}\s*년\s*\([^)]*\)|\d{1,3}\s*년|원년")
@@ -461,27 +417,57 @@ async def find_pdf_file(
     )
 
 
-@workflows.activity(name="pdf-read-text", start_to_close_timeout=IO_TIMEOUT)
-async def read_pdf_text(
-    file_id: str, client: ToolCallClient = Depends(drive)
-) -> str:
+@workflows.activity(name="pdf-load-pages", start_to_close_timeout=CONVERT_TIMEOUT)
+async def load_pages(
+    file_id: str,
+    page_start: int | None,
+    page_end: int | None,
+    client: ToolCallClient = Depends(drive),
+) -> tuple[list[tuple[int, str]], int]:
+    """원본 PDF에서 지정한 물리 페이지 범위의 텍스트를 페이지별로 추출한다.
+
+    파일 전체를 다운로드해 pypdf로 페이지를 읽으므로, 페이지 범위는
+    PDF 뷰어의 물리 페이지 번호(1-based)와 정확히 일치한다. 책 속의
+    인쇄 쪽번호가 권마다 다시 시작해도 영향을 받지 않는다.
+    다운로드→추출을 한 액티비티에서 처리해 결과(범위 텍스트)만
+    반환하므로 액티비티 결과가 base64 2MB 한도를 넘지 않는다.
+    """
+    import asyncio
+    import base64
+
     result = await client.call_tool(
-        tool_name="read_file_content",
+        tool_name="download_file_content",
         arguments={"file_id": file_id},
     )
     value = _tool_result_value(result)
-    text = value.get("file_content") if isinstance(value, dict) else value
-    if not isinstance(text, str) or not text.strip():
+    content = value.get("content") if isinstance(value, dict) else value
+    if not content:
         raise workflows.WorkflowError(
-            "PDF에서 텍스트를 추출하지 못했습니다. 텍스트 레이어가 있는 PDF인지 확인해 주세요.",
-            non_retryable=True,
+            "PDF 다운로드에 실패했습니다.", non_retryable=True
         )
-    if len(text) > MAX_TEXT_CHARS:
-        raise workflows.WorkflowError(
-            f"PDF 텍스트가 너무 깁니다({len(text):,}자). 파일을 나눠 업로드해 주세요.",
-            non_retryable=True,
-        )
-    return text
+    pdf_bytes = base64.b64decode(content)
+
+    def _extract() -> tuple[list[tuple[int, str]], int]:
+        import io
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        total = len(reader.pages)
+        first = (page_start or 1) - 1
+        last = page_end or total
+        if first >= total:
+            raise workflows.WorkflowError(
+                f"요청한 시작 페이지({page_start})가 전체 페이지 수({total})를 넘습니다.",
+                non_retryable=True,
+            )
+        extracted: list[tuple[int, str]] = []
+        for index in range(first, min(last, total)):
+            text = reader.pages[index].extract_text() or ""
+            extracted.append((index + 1, text.strip()))
+        return extracted, total
+
+    return await asyncio.to_thread(_extract)
 
 
 @workflows.activity(name="pdf-proofread-body", start_to_close_timeout=LLM_TIMEOUT)
@@ -651,14 +637,10 @@ class PdfDocumentReviewWorkflow:
         stem = source.title.rsplit(".", 1)[0] if "." in source.title else source.title
         output_parent_id = data.output_parent_id or source.parent_id
 
-        text = await read_pdf_text(source.file_id)
-        pages, total_pages = slice_pages(text, data.page_start, data.page_end)
-        blocks = [
-            BodyBlock(block_id=f"p{index}", text=paragraph.strip(), page=page_number)
-            for index, (page_number, page_text) in enumerate(pages)
-            for paragraph in re.split(r"\n\s*\n", page_text)
-            if paragraph.strip()
-        ]
+        pages, total_pages = await load_pages(
+            source.file_id, data.page_start, data.page_end
+        )
+        blocks = blocks_from_pages(pages)
 
         body_edits = await proofread_body(blocks)
         source_title_edits = await annotate_source_titles(blocks)

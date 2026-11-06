@@ -17,10 +17,9 @@ from worker.workflows.hwp_review_models import (
 )
 from worker.workflows.pdf_document_review import (
     PdfDocumentReviewWorkflow,
+    blocks_from_pages,
     detect_year,
-    extract_page_blocks,
     group_by_year,
-    split_pdf_pages,
 )
 
 
@@ -35,39 +34,23 @@ def make_pdf_text() -> str:
     return "\n".join(parts)
 
 
-def test_split_pdf_pages_reads_markers() -> None:
-    pages = split_pdf_pages(make_pdf_text())
-    assert [number for number, _ in pages] == list(range(6, 18))
-    assert "6번째 페이지 첫 문단입니다." in pages[0][1]
+def test_blocks_from_pages_splits_paragraphs() -> None:
+    from worker.workflows.pdf_document_review import blocks_from_pages
 
-
-def test_extract_page_blocks_slices_range() -> None:
-    blocks, total_pages = extract_page_blocks(
-        make_pdf_text(), page_start=8, page_end=15
-    )
-    assert total_pages == 17
-    assert {block.page for block in blocks} == set(range(8, 16))
-    assert len([b for b in blocks if b.page == 8]) == 2
+    pages = [
+        (8, "첫 문단입니다.\n\n둘째 문단입니다."),
+        (9, "한 줄\n두 번째 줄\n세 번째 줄"),
+    ]
+    blocks = blocks_from_pages(pages)
+    assert [(b.page, b.text) for b in blocks] == [
+        (8, "첫 문단입니다."),
+        (8, "둘째 문단입니다."),
+        (9, "한 줄"),
+        (9, "두 번째 줄"),
+        (9, "세 번째 줄"),
+    ]
     assert blocks[0].block_id == "p0"
-    assert blocks[0].text == "8번째 페이지 첫 문단입니다. 조선의 사적을 따른다."
-
-
-def test_extract_page_blocks_without_range_keeps_all() -> None:
-    blocks, _ = extract_page_blocks(make_pdf_text())
-    assert len(blocks) == 24
-    assert blocks[0].page == 6
-
-
-def test_extract_page_blocks_unknown_range_raises() -> None:
-    with pytest.raises(Exception):
-        extract_page_blocks(make_pdf_text(), page_start=50, page_end=60)
-
-
-def test_extract_page_blocks_without_markers_single_page() -> None:
-    text = "표식 없는 문서\n\n두 번째 문단"
-    blocks, total_pages = extract_page_blocks(text)
-    assert total_pages == 1
-    assert [b.page for b in blocks] == [1, 1]
+    assert blocks[4].block_id == "p4"
 
 
 def test_detect_year_reads_reign_year_headings() -> None:
@@ -328,9 +311,15 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     async def fake_find_pdf_file(file_name: str) -> DriveFileInfo:
         return DriveFileInfo(file_id="pdf-id", title="조선사.pdf", parent_id="folder-1")
 
-    @sdk_workflows.activity(name="pdf-read-text")
-    async def fake_read_pdf_text(file_id: str) -> str:
-        return pdf_text
+    @sdk_workflows.activity(name="pdf-load-pages")
+    async def fake_load_pages(
+        file_id: str, page_start: int | None, page_end: int | None
+    ) -> tuple[list[tuple[int, str]], int]:
+        pages = [
+            (number, f"{number}번째 페이지 첫 문단입니다. 조선의 사적을 따른다.\n\n{number}번째 페이지 둘째 문단, 태조 원년의 기사이다.")
+            for number in range(8, 16)
+        ]
+        return pages, 143
 
     @sdk_workflows.activity(name="pdf-upload-drive-file")
     async def fake_upload_drive_file(
@@ -394,7 +383,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     fake_parse.edit_calls = []
 
     monkeypatch.setattr(review_module, "find_pdf_file", fake_find_pdf_file)
-    monkeypatch.setattr(review_module, "read_pdf_text", fake_read_pdf_text)
+    monkeypatch.setattr(review_module, "load_pages", fake_load_pages)
     monkeypatch.setattr(review_module, "annotate_source_titles", fake_annotate_source_titles)
     monkeypatch.setattr(review_module, "compare_quotes", fake_compare_quotes)
     monkeypatch.setattr(review_module, "annotate_footnote_sources", fake_annotate_footnote_sources)
@@ -407,7 +396,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
         workflows=[PdfDocumentReviewWorkflow],
         activities=[
             fake_find_pdf_file,
-            fake_read_pdf_text,
+            fake_load_pages,
             fake_upload_drive_file,
             fake_build_result,
             fake_annotate_source_titles,
@@ -429,7 +418,7 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     output = PdfReviewOutput.model_validate(result)
     assert output.source_title == "조선사.pdf"
     assert output.stats["page_start"] == 8 and output.stats["page_end"] == 15
-    assert output.stats["total_pages"] == 17
+    assert output.stats["total_pages"] == 143
     assert output.stats["body_paragraphs"] == 16
     assert output.stats["body_edits"] == 1
     assert "8~15페이지" in output.summary
