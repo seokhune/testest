@@ -629,6 +629,28 @@ def append_review_report(
     from docx import Document
     from docx.enum.text import WD_BREAK
 
+    from worker.workflows.hwp_review_models import (
+        BodyFootnoteDifference,
+        HanjaTranslation,
+        SourceAnnotation,
+        TextEdit,
+    )
+
+    def _normalize(item, model_class):
+        if isinstance(item, model_class):
+            return item
+        return model_class.model_validate(item)
+
+    normalized_sections = []
+    for section in year_sections:
+        year = section[0]
+        edits = [_normalize(item, TextEdit) for item in section[1]]
+        translations = [_normalize(item, HanjaTranslation) for item in section[2]]
+        diffs = [_normalize(item, BodyFootnoteDifference) for item in section[3]]
+        annotations = [_normalize(item, SourceAnnotation) for item in section[4]]
+        normalized_sections.append((year, edits, translations, diffs, annotations))
+    year_sections = normalized_sections
+
     document = Document(io.BytesIO(docx_bytes))
     document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
     document.add_heading(f"{source_title} 검수 리포트", level=1)
