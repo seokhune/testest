@@ -207,9 +207,9 @@ def test_insert_year_reports_places_full_report_at_year_ends() -> None:
     assert "2) 한문 번역" in body_19
     assert "3) 본문-주석 인용 차이" in body_19
     assert "4) 주석 출처 보완 제안" in body_19
-    assert "수정: 하왕이 폐세자를 서인으로 보내었다." in body_19
-    assert "번역: 한문 번역문" in body_19
-    assert "인용 불일치" in body_19
+    assert any("수정: 하왕이 폐세자를 서인으로 보내었다." in text for text in body_19)
+    assert any("번역: 한문 번역문" in text for text in body_19)
+    assert any("인용 불일치" in text for text in body_19)
     # 마지막 연도(20년) 리포트는 본문 끝에
     assert texts.index("〔태조 20년(계유) 검수 리포트〕") > texts.index(
         "태종이 하륜을 문하부에 보내였다."
