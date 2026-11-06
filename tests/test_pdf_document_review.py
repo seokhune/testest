@@ -134,11 +134,12 @@ def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:
     return buffer.getvalue()
 
 
-def test_insert_year_summaries_places_block_at_year_ends() -> None:
+def test_insert_year_reports_places_full_report_at_year_ends() -> None:
     import io
 
     from docx import Document
-    from worker.workflows.pdf_document_review import insert_year_summaries
+    from worker.workflows.hwp_review_models import BodyFootnoteDifference
+    from worker.workflows.pdf_document_review import insert_year_reports
 
     document = Document()
     document.add_paragraph("태조 19년(임신) 정월에 하왕이 즉위하였다.")
@@ -160,8 +161,16 @@ def test_insert_year_summaries_places_block_at_year_ends() -> None:
                     reason="어미 교정",
                 )
             ],
-            [],
-            [],
+            [
+                HanjaTranslation(
+                    item_id="p0", original="漢文 주석", translation="한문 번역문"
+                )
+            ],
+            [
+                BodyFootnoteDifference(
+                    body_block_id="p1", footnote_id="2", difference="인용 불일치"
+                )
+            ],
             [],
         ),
         (
@@ -180,15 +189,31 @@ def test_insert_year_summaries_places_block_at_year_ends() -> None:
             [],
         ),
     ]
-    result = insert_year_summaries(buffer.getvalue(), sections)
+    result = insert_year_reports(buffer.getvalue(), sections)
     document = Document(io.BytesIO(result))
     texts = [p.text for p in document.paragraphs]
 
-    assert "〔태조 19년(임신) 검수 정리〕" in texts
-    assert "〔태조 20년(계유) 검수 정리〕" in texts
-    # 19년 정리는 20년 제목 직전에 위치해야 한다
-    assert texts.index("〔태조 19년(임신) 검수 정리〕") < texts.index("태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다.")
-    assert texts.index("〔태조 20년(계유) 검수 정리〕") > texts.index("태종이 하륜을 문하부에 보내였다.")
+    assert "〔태조 19년(임신) 검수 리포트〕" in texts
+    assert "〔태조 20년(계유) 검수 리포트〕" in texts
+    # 19년 리포트는 20년 제목 직전에 위치해야 한다
+    index_19 = texts.index("〔태조 19년(임신) 검수 리포트〕")
+    index_20_heading = texts.index(
+        "태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다."
+    )
+    assert index_19 < index_20_heading
+    # 리포트에 네 항목이 모두 들어 있어야 한다
+    body_19 = texts[index_19:index_20_heading]
+    assert "1) 교정 내역" in body_19
+    assert "2) 한문 번역" in body_19
+    assert "3) 본문-주석 인용 차이" in body_19
+    assert "4) 주석 출처 보완 제안" in body_19
+    assert "수정: 하왕이 폐세자를 서인으로 보내었다." in body_19
+    assert "번역: 한문 번역문" in body_19
+    assert "인용 불일치" in body_19
+    # 마지막 연도(20년) 리포트는 본문 끝에
+    assert texts.index("〔태조 20년(계유) 검수 리포트〕") > texts.index(
+        "태종이 하륜을 문하부에 보내였다."
+    )
 
 
 def test_apply_edits_by_text_preserves_formatting() -> None:
@@ -321,43 +346,6 @@ def test_apply_edits_skips_large_deletions() -> None:
 
     document = Document(io.BytesIO(result))
     assert "주석 인용문" in document.paragraphs[0].text
-
-
-def test_append_review_report_groups_by_year() -> None:
-    from worker.workflows.hwp_review_docx import append_review_report
-
-    docx_bytes = _docx_bytes_from_paragraphs(["본문 문단입니다."])
-    from worker.workflows.hwp_review_models import BodyFootnoteDifference
-
-    sections = [
-        (
-            "태종 6년(무인)",
-            [TextEdit(item_id="p1", original="원문", revised="수정", category="typo", reason="사유")],
-            [HanjaTranslation(item_id="p1", original="漢文", translation="번역")],
-            [
-                BodyFootnoteDifference(
-                    body_block_id="p1", footnote_id="2", difference="본문과 주석 인용이 다르다"
-                )
-            ],
-            [],
-        ),
-    ]
-    result = append_review_report(
-        docx_bytes, "조선사.pdf", sections, {"body_paragraphs": 2, "body_edits": 1, "hanja_translations": 1}
-    )
-
-    import io
-
-    from docx import Document
-
-    document = Document(io.BytesIO(result))
-    texts = [p.text for p in document.paragraphs]
-    assert "본문 문단입니다." in texts
-    assert "조선사.pdf 검수 리포트" in texts
-    assert "태종 6년(무인)" in texts
-    assert "수정: 수정" in texts
-    assert "번역: 번역" in texts
-    assert "[주석 2] 본문과 주석 인용이 다르다" in texts
 
 
 async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None:
