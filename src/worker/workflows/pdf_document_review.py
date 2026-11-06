@@ -197,7 +197,7 @@ def group_by_year(
             current = year
         section = section_for(current)
         if year and not section["heading"]:
-            section["heading"] = block.text
+            section["heading"] = block.text[:MAX_HEADING_CHARS]
         section["edits"].extend(edits_by_block.get(block.block_id, []))
         section["translations"].extend(translations_by_block.get(block.block_id, []))
         section["differences"].extend(differences_by_block.pop(block.block_id, []))
@@ -516,11 +516,12 @@ QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문 
 """
 
 
-MAX_EDITS = 100
-MAX_TRANSLATIONS = 100
-MAX_DIFFERENCES = 50
-MAX_ANNOTATIONS = 100
-MAX_ITEM_CHARS = 5000
+MAX_EDITS = 60
+MAX_TRANSLATIONS = 60
+MAX_DIFFERENCES = 30
+MAX_ANNOTATIONS = 60
+MAX_ITEM_CHARS = 1500
+MAX_HEADING_CHARS = 300
 
 
 def _cap_edits(edits: list) -> list:
