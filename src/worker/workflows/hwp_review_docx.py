@@ -131,6 +131,74 @@ def _replace_paragraph_text(paragraph: etree._Element, revised: str) -> None:
     t.text = revised
 
 
+def _apply_text_edit(paragraph: etree._Element, new_text: str) -> None:
+    """문단 텍스트를 글자 단위 diff로 교체해 서식을 최대한 보존한다.
+
+    변경된 글자만 run에 반영하고, 나머지 글자의 run 구조(굵기·글꼴·크기
+    등)는 그대로 둔다. 삽입되는 글자는 삽입 지점 앞 run의 서식을 물려받는다.
+    """
+    import copy
+    import difflib
+
+    text_nodes = [t for t in paragraph.iter(_w("t"))]
+    old_text = "".join(t.text or "" for t in text_nodes)
+    if old_text == new_text:
+        return
+    if not text_nodes:
+        run = etree.SubElement(paragraph, _w("r"))
+        t = etree.SubElement(run, _w("t"))
+        t.set(f"{{{XML_NS}}}space", "preserve")
+        t.text = new_text
+        return
+
+    matcher = difflib.SequenceMatcher(None, old_text, new_text, autojunk=False)
+    for tag, i1, i2, _j1, _j2 in reversed(matcher.get_opcodes()):
+        if tag == "equal":
+            continue
+        if tag in ("delete", "replace"):
+            for node in list(text_nodes):
+                start = sum(len(t.text or "") for t in text_nodes[: text_nodes.index(node)])
+                end = start + len(node.text or "")
+                if end <= i1 or start >= i2:
+                    continue
+                local_start = max(i1 - start, 0)
+                local_end = min(i2 - start, len(node.text or ""))
+                node.text = (node.text or "")[:local_start] + (node.text or "")[local_end:]
+        if tag in ("insert", "replace"):
+            inserted = new_text[_j1:_j2]
+            if not inserted:
+                continue
+            target = None
+            offset = 0
+            for node in text_nodes:
+                length = len(node.text or "")
+                if offset <= i1 <= offset + length:
+                    target = node
+                    break
+                offset += length
+            if target is None:
+                target = text_nodes[-1]
+                offset = sum(len(t.text or "") for t in text_nodes[:-1])
+            local = max(min(i1 - offset, len(target.text or "")), 0)
+            run = target.getparent()
+            prefix = (target.text or "")[:local]
+            suffix = (target.text or "")[local:]
+            target.text = prefix
+            for text_value, position in ((inserted, "after"), (suffix, "after")):
+                if not text_value:
+                    continue
+                clone = copy.deepcopy(run)
+                clone_ts = [t for t in clone.iter(_w("t"))]
+                if not clone_ts:
+                    continue
+                for extra in clone_ts[1:]:
+                    clone.remove(extra)
+                clone_ts[0].text = text_value
+                if position == "after":
+                    run.addnext(clone)
+                    run = clone
+
+
 def _append_run(paragraph: etree._Element, text: str) -> None:
     run = etree.SubElement(paragraph, _w("r"))
     t = etree.SubElement(run, _w("t"))
@@ -444,11 +512,13 @@ def apply_edits_by_text(
     hanja_translations: list[HanjaTranslation],
     blocks: list | None = None,
 ) -> tuple[bytes, int]:
-    """텍스트 매칭으로 문단을 찾아 교정/한문 번역을 그 자리에 반영한다.
+    """텍스트 매칭으로 문단을 찾아 교정을 그 자리에 반영한다.
 
     PDF에서 변환한 DOCX는 원본 문단 구조와 블록 순서가 어긋날 수 있어
-    항목 ID 대신 원문 텍스트 일치로 문단을 찾는다. 반환값은 (결과 bytes,
-    반영된 교정 수).
+    항목 ID 대신 원문 텍스트 일치로 문단을 찾는다. 교정은 글자 단위
+    diff로 반영해 서식(굵기·글꼴·크기·정렬)을 그대로 보존한다.
+    한문 번역은 본문을 건드리지 않고 리포트에서만 다룬다.
+    반환값은 (결과 bytes, 반영된 교정 수).
     """
     from docx import Document
 
@@ -460,22 +530,6 @@ def apply_edits_by_text(
     translated: set[int] = set()
 
     block_text_by_id = {block.block_id: block.text for block in blocks} if blocks else {}
-
-    for translation in hanja_translations:
-        needle = _norm(block_text_by_id.get(translation.item_id) or translation.original)
-        for i, paragraph in enumerate(paragraphs):
-            text = _norm(_element_text(paragraph))
-            if i in translated:
-                continue
-            if text == needle or (needle and text.startswith(needle[:60])):
-                translated_p = etree.Element(_w("p"))
-                run = etree.SubElement(translated_p, _w("r"))
-                t = etree.SubElement(run, _w("t"))
-                t.set(f"{{{XML_NS}}}space", "preserve")
-                t.text = f"번역: {translation.translation}"
-                paragraph.addnext(translated_p)
-                translated.add(i)
-                break
 
     applied = 0
     used: set[int] = set()
@@ -491,7 +545,7 @@ def apply_edits_by_text(
                 break
         if match_index is None:
             continue
-        _replace_paragraph_text(paragraphs[match_index], edit.revised)
+        _apply_text_edit(paragraphs[match_index], edit.revised)
         used.add(match_index)
         applied += 1
 
@@ -537,11 +591,71 @@ def build_structured_docx(
             document.add_paragraph(edit.revised if edit else cleaned)
             if edit:
                 applied += 1
-            translation = hanja_by_id.get(block_id)
-            if translation:
-                document.add_paragraph(f"번역: {translation.translation}")
             paragraph_index += 1
 
     buffer = io.BytesIO()
     document.save(buffer)
     return buffer.getvalue(), applied
+
+
+def append_review_report(
+    docx_bytes: bytes,
+    source_title: str,
+    year_sections: list,
+    stats: dict,
+) -> bytes:
+    """검수 결과 DOCX 끝에 리포트 섹션을 추가한다.
+
+    year_sections는 (년도 라벨, 교정 목록, 한문 번역 목록) 튜플 목록이다.
+    """
+    import io
+
+    from docx import Document
+    from docx.enum.text import WD_BREAK
+
+    document = Document(io.BytesIO(docx_bytes))
+    document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    document.add_heading(f"{source_title} 검수 리포트", level=1)
+
+    document.add_heading("1. 요약", level=2)
+    document.add_paragraph(
+        f"검수 문단 {stats.get('body_paragraphs', 0)}개 중 "
+        f"{stats.get('body_edits', 0)}개 문단을 교정하고, "
+        f"한문 번역 {stats.get('hanja_translations', 0)}건을 추가했습니다."
+    )
+    if stats.get("total_pages"):
+        document.add_paragraph(
+            f"총 {stats['total_pages']}페이지 중 "
+            f"{stats.get('page_start') or 1}~{stats.get('page_end') or stats['total_pages']}페이지 범위를 검수했습니다."
+        )
+
+    document.add_heading("2. 년도별 교정 내역", level=2)
+    has_content = False
+    for year, edits, _translations in year_sections:
+        if not edits:
+            continue
+        has_content = True
+        document.add_heading(year, level=3)
+        for edit in edits:
+            document.add_paragraph(f"({edit.category}) {edit.reason}")
+            document.add_paragraph(f"원문: {edit.original}")
+            document.add_paragraph(f"수정: {edit.revised}")
+    if not has_content:
+        document.add_paragraph("수정된 문단이 없습니다.")
+
+    document.add_heading("3. 년도별 한문 번역", level=2)
+    has_content = False
+    for year, _edits, translations in year_sections:
+        if not translations:
+            continue
+        has_content = True
+        document.add_heading(year, level=3)
+        for translation in translations:
+            document.add_paragraph(f"원문: {translation.original}")
+            document.add_paragraph(f"번역: {translation.translation}")
+    if not has_content:
+        document.add_paragraph("한문 번역 대상이 없습니다.")
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()

@@ -83,8 +83,6 @@ class PdfReviewInput(pydantic.BaseModel):
 
 class PdfReviewOutput(pydantic.BaseModel):
     source_title: str
-    corrected_file: DriveFileInfo
-    report_file: DriveFileInfo
-    inplace_file: DriveFileInfo | None = None
+    result_file: DriveFileInfo
     stats: dict[str, int]
     summary: str

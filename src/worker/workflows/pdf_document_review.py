@@ -38,6 +38,7 @@ from worker.workflows.hwp_review_models import (
     TextEdit,
 )
 from worker.workflows.hwp_review_docx import (
+    append_review_report,
     apply_edits_by_text,
     build_structured_docx,
     contains_hanja,
@@ -142,6 +143,49 @@ def extract_page_blocks(
                     )
                 )
     return blocks, total_pages
+
+
+YEAR_RE = re.compile(r"\d{1,3}\s*년\s*\([^)]*\)|\d{1,3}\s*년|원년")
+
+
+def detect_year(text: str) -> str | None:
+    """문단에서 년도 표기(예: '태종 6년(무인)')를 찾아 라벨로 반환한다."""
+    match = YEAR_RE.search(text[:60])
+    if not match:
+        return None
+    prefix = text[: match.start()]
+    king = re.search(r"[가-힣]{1,4}\s*$", prefix)
+    return ((king.group(0) if king else "") + match.group(0)).strip()
+
+
+def group_by_year(
+    blocks: list[BodyBlock],
+    body_edits: list[TextEdit],
+    hanja_translations: list[HanjaTranslation],
+) -> list[tuple[str, list[TextEdit], list[HanjaTranslation]]]:
+    """블록 순서대로 년도 구간을 따라가며 교정/번역을 년도별로 묶는다."""
+    sections: list[tuple[str, list[TextEdit], list[HanjaTranslation]]] = []
+    current = "기타"
+    edits_by_block: dict[str, list[TextEdit]] = {}
+    for edit in body_edits:
+        edits_by_block.setdefault(edit.item_id, []).append(edit)
+    translations_by_block: dict[str, list[HanjaTranslation]] = {}
+    for translation in hanja_translations:
+        translations_by_block.setdefault(translation.item_id, []).append(translation)
+    section_index: dict[str, int] = {}
+
+    for block in blocks:
+        year = detect_year(block.text)
+        if year:
+            current = year
+        if current not in section_index:
+            section_index[current] = len(sections)
+            sections.append((current, [], []))
+        index = section_index[current]
+        edits, translations = sections[index][1], sections[index][2]
+        edits.extend(edits_by_block.get(block.block_id, []))
+        translations.extend(translations_by_block.get(block.block_id, []))
+    return sections
 
 
 class _EditBatch(pydantic.BaseModel):
@@ -266,71 +310,25 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
     return translations
 
 
-@workflows.activity(name="pdf-build-outputs", start_to_close_timeout=IO_TIMEOUT)
-async def build_output_docx(
-    source_title: str,
-    blocks: list[BodyBlock],
-    body_edits: list[TextEdit],
-    hanja_translations: list[HanjaTranslation],
-) -> tuple[str, str]:
-    """교정본 DOCX와 검수 리포트 DOCX를 만들어 base64로 반환한다."""
-    import base64
-    import io
-
-    from docx import Document
-
-    edits_by_id = {edit.item_id: edit for edit in body_edits}
-    hanja_by_id = {translation.item_id: translation for translation in hanja_translations}
-
-    corrected = Document()
-    corrected.add_heading(f"{source_title} 교정본", level=1)
-    for block in blocks:
-        edit = edits_by_id.get(block.block_id)
-        corrected.add_paragraph(edit.revised if edit else block.text)
-        translation = hanja_by_id.get(block.block_id)
-        if translation:
-            corrected.add_paragraph(f"번역: {translation.translation}")
-
-    report = Document()
-    report.add_heading(f"{source_title} 검수 리포트", level=1)
-    report.add_heading("1. 교정 요약", level=2)
-    report.add_paragraph(f"검수 문단 {len(blocks)}개 중 {len(body_edits)}개 수정.")
-    if hanja_translations:
-        report.add_paragraph(f"한문 번역 {len(hanja_translations)}건 추가.")
-    report.add_heading("2. 교정 내역", level=2)
-    if not body_edits:
-        report.add_paragraph("수정된 문단이 없습니다.")
-    for edit in body_edits:
-        report.add_paragraph(f"[{edit.item_id}] ({edit.category}) {edit.reason}")
-        report.add_paragraph(f"원문: {edit.original}")
-        report.add_paragraph(f"수정: {edit.revised}")
-
-    def _to_b64(document: Document) -> str:
-        buffer = io.BytesIO()
-        document.save(buffer)
-        return base64.b64encode(buffer.getvalue()).decode()
-
-    return _to_b64(corrected), _to_b64(report)
-
-
-@workflows.activity(
-    name="pdf-build-inplace", start_to_close_timeout=CONVERT_TIMEOUT
-)
-async def build_inplace_edition(
+@workflows.activity(name="pdf-build-result", start_to_close_timeout=CONVERT_TIMEOUT)
+async def build_result_docx(
     source: DriveFileInfo,
     pages: list[tuple[int, str]],
     blocks: list[BodyBlock],
     total_pages: int,
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
+    year_sections: list[tuple[str, list, list]],
+    stats: dict[str, int],
     client: ToolCallClient = Depends(drive),
-) -> tuple[str, int]:
-    """원본 PDF 양식을 그대로 유지한 수정반영본을 만든다.
+) -> str:
+    """검수 결과 한 파일(원본 양식 본문 + 년도별 리포트)을 만들어 base64로 반환한다.
 
     다운로드→변환→교정을 한 액티비티 안에서 처리하고 작은 DOCX만
     반환한다(액티비티 결과가 base64 2MB 이벤트 한도를 넘지 않게).
-    검수 범위에 해당하는 물리 페이지만 pdf2docx로 변환한다. 변환에
-    실패하면 원본 페이지 구조를 재구성한 DOCX로 대체한다.
+    원본 PDF를 pdf2docx로 변환해 양식을 유지하고, 그 뒤에 년도별
+    교정 내역/한문 번역 리포트를 붙인다. 변환에 실패하면 페이지
+    구조를 재구성한 본문으로 대체한다.
     """
     import asyncio
     import base64
@@ -351,20 +349,23 @@ async def build_inplace_edition(
         docx_bytes = await asyncio.to_thread(
             convert_pdf_to_docx, pdf_bytes, start, end
         )
-        edited, applied = await asyncio.to_thread(
+        edited, _applied = await asyncio.to_thread(
             apply_edits_by_text, docx_bytes, body_edits, hanja_translations, blocks
         )
-        return base64.b64encode(edited).decode(), applied
     except Exception as error:
         import logging
 
         logging.getLogger(__name__).warning(
             "원본 양식 변환 실패, 구조 재구성으로 대체: %s", error
         )
-    edited, applied = await asyncio.to_thread(
-        build_structured_docx, pages, blocks, body_edits, hanja_translations
+        edited, _applied = await asyncio.to_thread(
+            build_structured_docx, pages, blocks, body_edits, hanja_translations
+        )
+
+    final = await asyncio.to_thread(
+        append_review_report, edited, source.title, year_sections, stats
     )
-    return base64.b64encode(edited).decode(), applied
+    return base64.b64encode(final).decode()
 
 
 @workflows.activity(
@@ -421,39 +422,7 @@ class PdfDocumentReviewWorkflow:
         body_edits = await proofread_body(blocks)
         hanja_translations = await translate_hanja_blocks(blocks)
 
-        corrected_b64, report_b64 = await build_output_docx(
-            source.title, blocks, body_edits, hanja_translations
-        )
-
-        range_suffix = ""
-        if data.page_start is not None or data.page_end is not None:
-            range_start = data.page_start or 1
-            range_end = data.page_end or total_pages
-            range_suffix = f"_p{range_start}-{range_end}"
-
-        corrected = await upload_drive_file(
-            f"{stem}{range_suffix}_교정본.docx", corrected_b64, output_parent_id
-        )
-        report = await upload_drive_file(
-            f"{stem}{range_suffix}_검수리포트.docx", report_b64, output_parent_id
-        )
-
-        inplace_b64, applied = await build_inplace_edition(
-            source, pages, blocks, total_pages, body_edits, hanja_translations
-        )
-        inplace_file = await upload_drive_file(
-            f"{stem}{range_suffix}_수정반영본.docx",
-            inplace_b64,
-            output_parent_id,
-        )
-        inplace_note = f" 수정반영본에 {applied}건을 반영했습니다."
-
-        page_note = ""
-        if range_suffix:
-            page_note = (
-                f" (총 {total_pages}페이지 중 "
-                f"{data.page_start or 1}~{data.page_end or total_pages}페이지)"
-            )
+        year_sections = group_by_year(blocks, body_edits, hanja_translations)
         stats = {
             "body_paragraphs": len(blocks),
             "body_edits": len(body_edits),
@@ -462,15 +431,45 @@ class PdfDocumentReviewWorkflow:
             "page_start": data.page_start or 0,
             "page_end": data.page_end or 0,
         }
+
+        result_b64 = await build_result_docx(
+            source,
+            pages,
+            blocks,
+            total_pages,
+            body_edits,
+            hanja_translations,
+            year_sections,
+            stats,
+        )
+
+        range_suffix = ""
+        if data.page_start is not None or data.page_end is not None:
+            range_start = data.page_start or 1
+            range_end = data.page_end or total_pages
+            range_suffix = f"_p{range_start}-{range_end}"
+
+        result_file = await upload_drive_file(
+            f"{stem}{range_suffix}_검수결과.docx", result_b64, output_parent_id
+        )
+
+        page_note = ""
+        if range_suffix:
+            page_note = (
+                f" (총 {total_pages}페이지 중 "
+                f"{data.page_start or 1}~{data.page_end or total_pages}페이지)"
+            )
+        year_note = " · ".join(
+            year for year, edits, _ in year_sections if edits or _
+        )
         summary = (
             f"본문 {len(blocks)}문단을 검수해{page_note} "
-            f"{len(body_edits)}건을 교정하고 한문 번역 {len(hanja_translations)}건을 추가했습니다."
+            f"{len(body_edits)}건을 교정하고 한문 번역 {len(hanja_translations)}건을 추가했습니다. "
+            f"년도 구간: {year_note}"
         )
         return PdfReviewOutput(
             source_title=source.title,
-            corrected_file=corrected,
-            report_file=report,
-            inplace_file=inplace_file,
+            result_file=result_file,
             stats=stats,
-            summary=summary + inplace_note,
+            summary=summary,
         )
