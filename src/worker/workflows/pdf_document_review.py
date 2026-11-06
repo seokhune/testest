@@ -558,7 +558,7 @@ async def build_result_docx(
     total_pages: int,
     body_edits: list[TextEdit],
     hanja_translations: list[HanjaTranslation],
-    year_sections: list[tuple[str, list, list]],
+    year_sections: list[tuple],
     stats: dict[str, int],
     client: ToolCallClient = Depends(drive),
 ) -> str:
