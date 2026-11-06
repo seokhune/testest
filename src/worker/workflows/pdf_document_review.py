@@ -839,11 +839,26 @@ class PdfDocumentReviewWorkflow:
         )
         blocks = blocks_from_pages(pages)
 
-        body_edits = await proofread_body(blocks)
-        source_title_edits = await annotate_source_titles(blocks)
-        hanja_translations = await translate_hanja_blocks(blocks)
-        source_annotations = await annotate_footnote_sources(blocks)
-        differences = await compare_quotes(blocks)
+        async def _guarded(name: str, call):
+            try:
+                return await call
+            except Exception as error:
+                raise workflows.WorkflowError(
+                    f"{name} 실패: {type(error).__name__}: {str(error)[:300]}",
+                    non_retryable=True,
+                ) from error
+
+        body_edits = await _guarded("본문 교정", proofread_body(blocks))
+        source_title_edits = await _guarded(
+            "서지명 표기", annotate_source_titles(blocks)
+        )
+        hanja_translations = await _guarded(
+            "한문 번역", translate_hanja_blocks(blocks)
+        )
+        source_annotations = await _guarded(
+            "주석 출처 판독", annotate_footnote_sources(blocks)
+        )
+        differences = await _guarded("본문-주석 비교", compare_quotes(blocks))
 
         body_edits = reconcile_edits(blocks, body_edits + source_title_edits)
         hanja_translations = reconcile_translations(blocks, hanja_translations)
@@ -872,7 +887,7 @@ class PdfDocumentReviewWorkflow:
             "page_end": data.page_end or 0,
         }
 
-        result_b64 = await build_result_docx(
+        result_b64 = await _guarded("결과 문서 생성", build_result_docx(
             source,
             pages,
             blocks,
@@ -881,7 +896,7 @@ class PdfDocumentReviewWorkflow:
             hanja_translations,
             year_sections,
             stats,
-        )
+        ))
 
         range_suffix = ""
         if data.page_start is not None or data.page_end is not None:
