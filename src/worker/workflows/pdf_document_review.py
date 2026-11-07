@@ -233,7 +233,7 @@ def _year_reports(section: dict) -> list:
         f"〔{year} 검수 리포트〕",
         (
             f"교정 {len(edits)}건 · 한문 번역 {len(translations)}건 · "
-            f"본문-주석 인용 차이 {len(diffs)}건 · 주석 출처 보완 제안 {len(annotations)}건"
+            f"본문-주석 내용 차이 {len(diffs)}건 · 주석 출처 보완 제안 {len(annotations)}건"
         ),
         "1) 교정 내역",
     ]
@@ -244,21 +244,21 @@ def _year_reports(section: dict) -> list:
             lines.append(f"  수정: {edit.revised}")
     else:
         lines.append("수정된 문단이 없습니다.")
-    lines.append("2) 한문 번역")
+    lines.append("2) 한문 번역 - 주석번역")
     if translations:
         for translation in translations:
             lines.append(f"· 원문: {translation.original}")
             lines.append(f"  번역: {translation.translation}")
     else:
         lines.append("한문 번역 대상이 없습니다.")
-    lines.append("3) 본문-주석 인용 차이")
+    lines.append("3) 본문-주석 내용 차이")
     if diffs:
         for difference in diffs:
             lines.append(
                 f"· [주석 {difference.footnote_id or '-'}] {difference.difference}"
             )
     else:
-        lines.append("본문-주석 인용 차이가 없습니다.")
+        lines.append("본문-주석 내용 차이가 없습니다.")
     lines.append("4) 주석 출처 보완 제안")
     if annotations:
         for annotation in annotations:
@@ -944,7 +944,7 @@ class PdfDocumentReviewWorkflow:
         summary = (
             f"본문 {len(blocks)}문단을 검수해{page_note} "
             f"{len(body_edits)}건을 교정하고 한문 번역 {len(hanja_translations)}건을 추가했으며, "
-            f"본문-주석 인용 차이 {len(differences)}건과 주석 출처 보완 제안 "
+            f"본문-주석 내용 차이 {len(differences)}건과 주석 출처 보완 제안 "
             f"{len(source_annotations)}건을 확인했습니다. "
             f"년도 구간: {year_note}"
         )
