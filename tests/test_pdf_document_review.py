@@ -212,8 +212,8 @@ def test_insert_year_reports_places_full_report_at_year_ends() -> None:
     # 리포트에 네 항목이 모두 들어 있어야 한다
     body_19 = texts[index_19:index_20_heading]
     assert "1) 교정 내역" in body_19
-    assert "2) 한문 번역" in body_19
-    assert "3) 본문-주석 인용 차이" in body_19
+    assert "2) 한문 번역 - 주석번역" in body_19
+    assert "3) 본문-주석 내용 차이" in body_19
     assert "4) 주석 출처 보완 제안" in body_19
     assert any("수정: 하왕이 폐세자를 서인으로 보내었다." in text for text in body_19)
     assert any("번역: 한문 번역문" in text for text in body_19)
@@ -474,5 +474,5 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     assert output.stats["body_paragraphs"] == 16
     assert output.stats["body_edits"] == 1
     assert "8~15페이지" in output.summary
-    assert "인용 차이" in output.summary
+    assert "내용 차이" in output.summary
     assert uploaded == ["조선사_p8-15_검수결과.docx"]
