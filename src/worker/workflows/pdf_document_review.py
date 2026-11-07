@@ -47,7 +47,7 @@ from worker.workflows.hwp_review_docx import (
     unwrap_text_frames,
 )
 
-REVIEW_MODEL = "mistral-medium-latest"
+REVIEW_MODEL = "mistral-large-latest"
 LLM_CHUNK_SIZE = 8
 LLM_TIMEOUT = timedelta(seconds=900)
 IO_TIMEOUT = timedelta(seconds=120)
