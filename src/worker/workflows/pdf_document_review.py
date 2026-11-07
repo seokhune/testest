@@ -239,24 +239,21 @@ def _year_reports(section: dict) -> list:
     ]
     if edits:
         for edit in edits:
-            lines.append(f"· ({edit.category}) {edit.reason}")
-            lines.append(f"  원문: {edit.original}")
-            lines.append(f"  수정: {edit.revised}")
+            lines.append(f"—원문: {edit.original}")
+            lines.append(f"—수정: {edit.revised}")
     else:
         lines.append("수정된 문단이 없습니다.")
     lines.append("2) 한문 번역 - 주석번역")
     if translations:
         for translation in translations:
-            lines.append(f"· 원문: {translation.original}")
+            lines.append(f"· 원문 - **{translation.item_id}**: {translation.original}")
             lines.append(f"  번역: {translation.translation}")
     else:
         lines.append("한문 번역 대상이 없습니다.")
     lines.append("3) 본문-주석 내용 차이")
     if diffs:
         for difference in diffs:
-            lines.append(
-                f"· [주석 {difference.footnote_id or '-'}] {difference.difference}"
-            )
+            lines.append(f"· {difference.difference}")
     else:
         lines.append("본문-주석 내용 차이가 없습니다.")
     lines.append("4) 주석 출처 보완 제안")
@@ -456,14 +453,15 @@ class _SourceBatch(pydantic.BaseModel):
 BODY_PROOFREAD_PROMPT = """아래는 번역서 본문 문단 목록입니다.
 
 규칙:
-1. 오타자(맞춤법, 띄어쓰기, 오타)를 수정하십시오.
-2. 문법에 맞게 윤문되되, 번역된 내용(의미)은 절대 바꾸지 마십시오.
-3. 원고의 문체를 그대로 유지하십시오. 종결형(예: '~하였다'/'~했다'), 어투, 경어체/평어체, 한자 병기 방식은 원문을 따르고, 다른 문체로 바꾸는 윤문을 하지 마십시오.
-4. 주석 번호(1), 2) 등)와 주석 인용문, 괄호 안 출처 표기는 절대 삭제하거나 변경하지 마십시오.
-5. revised는 해당 문단의 전체 최종 텍스트여야 하며, 원문의 모든 내용(주석 포함)을 빠짐없이 포함해야 합니다.
-6. 변경이 필요한 문단만 edits에 포함하십시오. 변경이 없으면 빈 목록을 반환하십시오.
+1. 본문의 오타자(맞춤법, 오타)를 수정하십시오.
+2. 문법에 안 맞는 것은 교정하십시오. 내용을 바꾸지 말고 있는 그대로 교정과 문법에 맞게 윤문하면 됩니다.
+3. 절대 다른 자료를 찾아 넣지 마십시오. 여기에 있는 내용만 가지고 하십시오.
+4. 원고의 문체를 그대로 유지하십시오.
+5. 주석 번호와 주석 인용문은 절대 삭제하거나 변경하지 마십시오.
+6. revised는 해당 문단의 전체 최종 텍스트여야 합니다.
+7. 변경이 필요한 문단만 edits에 포함하십시오. 변경이 없으면 빈 목록을 반환하십시오.
 
-각 항목은 item_id(대괄호 안 문단 번호), original(원문 전체), revised(수정문 전체), category(typo|grammar|spacing|style 중 하나), reason(변경 이유 한 문장)을 포함합니다.
+각 항목은 item_id(대괄호 안 문단 번호), original(원문 전체), revised(수정문 전체), category(교정 유형), reason(변경 이유)을 포함합니다.
 
 문단 목록:
 """
@@ -472,11 +470,12 @@ HANJA_TRANSLATE_PROMPT = """아래는 번역서 문단 목록입니다. 한문(�
 
 규칙:
 1. 한문 구절을 자연스러운 한국어로 번역하십시오.
-2. 한자가 일부 포함되었어도 대부분 한국어라면 번역하지 말고 건너뛰십시오. 이미 한국어로만 작성된 주석도 건너뛰십시오.
+2. 한자가 일부 포함되었어도 대부분 한국어라면 번역하지 말고 건너뛰십시오.
 3. 결과가 없으면 빈 목록을 반환하십시오.
 4. translation에는 번역만 담고 원문 그대로는 포함하지 마십시오.
+5. item_id에는 해당 주석의 번호를 사용하십시오. 문단 텍스트에서 "N)" 형식의 주석 번호를 찾아 item_id를 "주석 N번"으로 지정하십시오. 주석 번호가 없으면 문단 번호를 그대로 사용하십시오.
 
-각 항목은 item_id(대괄호 안 문단 번호), original(한문 구절이 포함된 문단 전체), translation(한문 번역)을 포함합니다.
+각 항목은 item_id(주석 번호, 예: "주석 23번"), original(한문 구절이 포함된 문단 전체), translation(한문 번역)을 포함합니다.
 
 문단 목록:
 """
@@ -508,15 +507,23 @@ FOOTNOTE_SOURCE_PROMPT = """아래는 번역서 문단 목록입니다. 주석�
 문단 목록:
 """
 
-QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문 내용과 주석 내용을 비교하여 다음을 찾아 differences에 정리하십시오.
+QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문(한국어 번역)과 주석(한문 원문)을 대조하여, 본문이 주석의 원문 내용을 충실히 번역했는지 확인하십시오.
 
-- 주석의 인용이 본문의 특정 표현과 맞지 않는 경우(인용 불일치, 대상 불일치, 수치·연도 불일치 등)
-- 본문은 언급했는데 주석이 관련 내용을 담고 있지 않은 경우
-- 주석과 본문의 서술이 상충하는 경우
+가장 중요한 검사입니다. 절대 다른 자료를 찾지 말고 여기에 있는 내용만으로 판단하십시오.
+
+다음을 찾아 differences에 정리하십시오:
+- 본문이 주석 원문의 내용을 누락했거나 추가했거나 왜곡한 경우
+- 본문과 주석 원문의 수치·연도·인명·지명이 다른 경우
+- 본문이 주석 원문의 의미를 반대로 해석했거나 과장/축소한 경우
+
+차이점은 반드시 다음 형식으로 서술하십시오:
+"본문에는 ~~~라고 했는데, 주석 원문에는 ~~~이다. 그러므로 본문은 주석의 내용과 큰 차이가 난다."
+또는
+"본문이 주석을 왜곡했다. 주석 원문의 ~~~ 부분을 ~~~로 잘못 번역했다."
 
 차이가 없으면 빈 목록을 반환하십시오.
 
-각 항목은 body_block_id(대괄호 안 문단 번호), footnote_id(해당 주석 번호, 모르면 빈 문자열), difference(차이점에 대한 구체적 서술)을 포함합니다.
+각 항목은 body_block_id(대괄호 안 문단 번호), footnote_id(해당 주석 번호, 모르면 빈 문자열), difference(위 형식의 구체적 서술)을 포함합니다.
 
 문단 목록:
 """
@@ -869,9 +876,6 @@ class PdfDocumentReviewWorkflow:
                 ) from error
 
         body_edits = await _guarded("본문 교정", proofread_body(blocks))
-        source_title_edits = await _guarded(
-            "서지명 표기", annotate_source_titles(blocks)
-        )
         hanja_translations = await _guarded(
             "한문 번역", translate_hanja_blocks(blocks)
         )
@@ -880,7 +884,7 @@ class PdfDocumentReviewWorkflow:
         )
         differences = await _guarded("본문-주석 비교", compare_quotes(blocks))
 
-        body_edits = reconcile_edits(blocks, body_edits + source_title_edits)
+        body_edits = reconcile_edits(blocks, body_edits)
         hanja_translations = reconcile_translations(blocks, hanja_translations)
         source_annotations = [
             annotation
