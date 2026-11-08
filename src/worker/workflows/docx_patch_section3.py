@@ -20,10 +20,7 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 
 from worker.workflows.hwp_review_models import DriveFileInfo
-from worker.workflows.pdf_document_review import (
-    _tool_result_value,
-    find_pdf_file,
-)
+from worker.workflows.pdf_document_review import _tool_result_value
 
 drive = connector(name="google_drive_mcp")
 
@@ -43,6 +40,46 @@ class DocxPatchOutput(pydantic.BaseModel):
     result_file: DriveFileInfo
     stats: dict[str, int]
     summary: str
+
+
+@workflows.activity(name="docx-find-file", start_to_close_timeout=PATCH_TIMEOUT)
+async def find_docx_file(
+    file_name: str, client: ToolCallClient = Depends(drive)
+) -> DriveFileInfo:
+    """이름으로 Drive 문서(DOCX)를 찾는다. 같은 이름이 여러 개면 최신 것을 고른다."""
+    result = await client.call_tool(
+        tool_name="search_files",
+        arguments={"query": f"title contains '{file_name}'", "page_size": 25},
+    )
+    value = _tool_result_value(result)
+    files = value.get("files") if isinstance(value, dict) else value
+    files = files or []
+    candidates = [
+        file
+        for file in files
+        if (file.get("title") or "").lower().endswith(".docx")
+        and file_name.lower() in (file.get("title") or "").lower()
+    ]
+    if not candidates:
+        raise workflows.WorkflowError(
+            f"드라이브에서 문서를 찾지 못했습니다: {file_name}",
+            non_retryable=True,
+        )
+
+    def _created(file):
+        created = str(file.get("created_time") or file.get("modified_time") or "")
+        return created
+
+    candidates.sort(key=_created, reverse=True)
+    file = candidates[0]
+    return DriveFileInfo(
+        file_id=file.get("id") or "",
+        title=file.get("title") or "",
+        parent_id=file.get("parent_id"),
+        mime_type=file.get("mime_type"),
+        view_url=file.get("view_url"),
+        file_size=int(file.get("file_size") or 0) or None,
+    )
 
 
 @workflows.activity(name="docx-patch-section3", start_to_close_timeout=PATCH_TIMEOUT)
@@ -141,12 +178,12 @@ async def patch_section3(
 class DocxPatchSection3Workflow:
     @workflows.workflow.entrypoint
     async def run(self, data: DocxPatchInput) -> DocxPatchOutput:
-        source = await find_pdf_file(data.file_name)
+        source = await find_docx_file(data.file_name)
         stem = source.title.rsplit(".", 1)[0] if "." in source.title else source.title
         parent = data.output_parent_id or source.parent_id
         result_file, replaced, inserted = await patch_section3(
             source.file_id,
-            f"{stem}_검수결과_최종.docx",
+            f"{stem}_최종.docx",
             data.lines,
             parent,
         )
