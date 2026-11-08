@@ -898,3 +898,13 @@ def test_verifier_tolerates_parenthesis_extraction_differences() -> None:
     )
     errors = verify_review_docx(buffer.getvalue(), [block], [], [], [])
     assert errors == []
+
+
+def test_char_coverage_catches_real_loss_but_tolerates_reordering() -> None:
+    from worker.workflows.review_verifier import _char_coverage
+
+    needle = "왕이 삼군을 거느리고 개경으로 향하였다"
+    # 순서가 바뀌어도 글자가 다 있으면 통과
+    assert _char_coverage(needle, "향하였다 개경으로 거느리고 왕이 삼군을")
+    # 글자가 대량 소실되면 실패 (152자 절단 사고)
+    assert not _char_coverage(needle, "왕이 삼군을")

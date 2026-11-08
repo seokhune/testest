@@ -32,6 +32,26 @@ def _norm(text: str) -> str:
     return unicodedata.normalize("NFC", "".join((text or "").split()))
 
 
+def _char_coverage(needle: str, haystack: str, threshold: float = 0.95) -> bool:
+    """needle의 글자(한글·숫자)들이 haystack에 95% 이상 존재하는지.
+
+    순서·괄호·한자 인코딩·diff 적용 흔적과 무관하게, 실제 글자 소실만
+    잡는 최종 안전 대조다.
+    """
+    if not needle:
+        return True
+    from collections import Counter
+
+    haystack_counts = Counter(haystack)
+    needle_counts = Counter(needle)
+    total = sum(needle_counts.values())
+    missing = sum(
+        max(0, count - haystack_counts.get(char, 0))
+        for char, count in needle_counts.items()
+    )
+    return missing <= total * (1 - threshold)
+
+
 # 한글과 숫자 외의 모든 것(한자·문장부호·괄호 등)을 제거한다.
 # pypdf는 '청태(淸泰) 3년'처럼 괄호를 추출하고 pdf2docx는 '청태3년'처럼
 # 떼어내는 등, 두 엔진의 문장부호 추출이 달라 최종 대조는 한글·숫자만으로 한다.
@@ -99,6 +119,9 @@ def verify_review_docx(
                 present = korean_original in whole_korean
             if not present and len(korean_revised) >= 10:
                 present = korean_revised in whole_korean
+            # 최종 안전 대조: 글자 커버리지(실제 소실만 실패)
+            if not present and len(korean_original) >= 10:
+                present = _char_coverage(korean_original, whole_korean)
         if not present:
             expected = revised_by_block.get(block.block_id) or block.text
             missing_body.append(
@@ -118,6 +141,8 @@ def verify_review_docx(
             korean = _korean_only(block.text)
             if len(korean) >= 10:
                 present = korean in whole_korean
+            if not present and len(korean) >= 10:
+                present = _char_coverage(korean, whole_korean)
         if not present:
             number_match = re.match(r"^\s*(\d{1,3})\s*\)", block.text.strip())
             label = f"각주 {number_match.group(1)}번" if number_match else block.block_id
