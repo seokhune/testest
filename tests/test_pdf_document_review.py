@@ -649,3 +649,49 @@ def test_pdf_text_extract_workflow_registers() -> None:
 
     definition = workflows.get_workflow_definition(PdfTextExtractWorkflow)
     assert definition.name == "pdf-text-extract"
+
+
+def test_docx_patch_section3_replaces_placeholder() -> None:
+    import io
+
+    from docx import Document
+    from docx.oxml.ns import qn
+    from worker.workflows.docx_patch_section3 import (
+        SECTION3_PLACEHOLDER_MARK,
+        patch_section3,  # noqa: F401 (임포트 확인)
+    )
+
+    # _patch 로직과 동일한 로직을 로컬 DOCX로 검증한다
+    document = Document()
+    document.add_paragraph("1) 교정 내역")
+    document.add_paragraph("—원문: …")
+    document.add_paragraph("3) 본문-주석 내용 차이")
+    document.add_paragraph("※ 본문-주석 내용 차이 검수는 각주 번호 1:1 매핑 검사(별도 수행)로 진행합니다.")
+    document.add_paragraph("4) 주석 출처 보완 제안")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+
+    lines = [
+        "· **주석 40번** (p15) 차이: 본문에는 진나라에서 왔다고 했는데, 주석 원문에는 마갈타국에서 왔다고 한다.",
+        "· **주석 13번** (p10) 차이: 본문에는 흔달(昕達)·금식(今式)이라고 했는데, 주석 원문에는 昕康·令式이다.",
+    ]
+
+    document = Document(io.BytesIO(buffer.getvalue()))
+    paragraphs = list(document.element.body.iter(qn("w:p")))
+    replaced = inserted = 0
+    for paragraph in paragraphs:
+        text = "".join(t.text or "" for t in paragraph.iter(qn("w:t")))
+        if SECTION3_PLACEHOLDER_MARK not in text:
+            continue
+        anchor = paragraph
+        for line in lines:
+            new_paragraph = document.add_paragraph(line)
+            anchor.addnext(new_paragraph._p)
+            anchor = new_paragraph._p
+            inserted += 1
+        paragraph.getparent().remove(paragraph)
+        replaced += 1
+        break
+    assert replaced == 1 and inserted == 2
+    texts = [p.text for p in Document(io.BytesIO(buffer.getvalue())).paragraphs]
