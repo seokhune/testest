@@ -348,7 +348,11 @@ def _year_reports(section: dict) -> list:
     lines.append("2) 한문 번역 - 주석번역")
     if translations:
         for translation in translations:
-            label = _footnote_label(translation.item_id, translation.original)
+            label = (
+                f"주석 {translation.footnote_number}번"
+                if getattr(translation, "footnote_number", None)
+                else _footnote_label(translation.item_id, translation.original)
+            )
             lines.append(f"· 원문 - **{label}**: {translation.original}")
             lines.append(f"  번역: {translation.translation}")
     else:
@@ -887,11 +891,16 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
     async def _attempt_one(block: BodyBlock) -> HanjaTranslation | None:
         listing = f"[{block.block_id}] {block.text}"
         result = await _parse(_HanjaBatch, HANJA_TRANSLATE_PROMPT + listing)
+        # 각주 번호는 원고 블록에서 확정한다(LLM 인용은 번호를 빼는 경우가 있다).
+        footnote_number = _footnote_number(block.text)
         for translation in result.translations:
             matched = match_translation_to_block(translation, [block])
             if matched is not None:
                 return translation.model_copy(
-                    update={"item_id": block.block_id}
+                    update={
+                        "item_id": block.block_id,
+                        "footnote_number": footnote_number,
+                    }
                 )
         return None
 

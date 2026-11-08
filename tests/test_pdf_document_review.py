@@ -908,3 +908,29 @@ def test_char_coverage_catches_real_loss_but_tolerates_reordering() -> None:
     assert _char_coverage(needle, "향하였다 개경으로 거느리고 왕이 삼군을")
     # 글자가 대량 소실되면 실패 (152자 절단 사고)
     assert not _char_coverage(needle, "왕이 삼군을")
+
+
+def test_translation_label_uses_manuscript_footnote_number() -> None:
+    """LLM이 원문에서 각주 번호를 빼도 라벨은 원고 기준 번호여야 한다."""
+    from worker.workflows.hwp_review_models import HanjaTranslation, BodyBlock
+    from worker.workflows.pdf_document_review import _year_reports
+
+    section = {
+        "year": "태조 19년(임신)",
+        "edits": [],
+        "translations": [
+            # LLM이 '6)'을 뺀 채 인용한 경우 — 라벨은 원고의 6번이어야 한다
+            HanjaTranslation(
+                item_id="p11",
+                original="夏六月 珍熋請曰 老臣遲暮 來投聖化",
+                translation="여름 6월에 진선이 청하기를…",
+                footnote_number="6",
+            )
+        ],
+        "differences": [],
+        "annotations": [],
+    }
+    lines = _year_reports(section)
+    joined = "\\n".join(lines)
+    assert "**주석 6번**" in joined
+    assert "**p11**" not in joined

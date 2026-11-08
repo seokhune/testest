@@ -74,6 +74,7 @@ class HanjaTranslation(pydantic.BaseModel):
     item_id: str
     original: str
     translation: str
+    footnote_number: str | None = None
 
 
 def _coerce_str(value):
