@@ -641,3 +641,11 @@ def test_apply_edits_preserves_merged_paragraph_tail() -> None:
     assert "3천 2백 명" in text
     # 꼬리 전체가 살아 있어야 한다 (135자 증발 사고 방지)
     assert "5천 7백 급을 참수하였다. 【황산】 적병이 궤멸되어 패주하였다." in text
+
+
+def test_pdf_text_extract_workflow_registers() -> None:
+    import mistralai.workflows as workflows
+    from worker.workflows.pdf_text_extract import PdfTextExtractWorkflow
+
+    definition = workflows.get_workflow_definition(PdfTextExtractWorkflow)
+    assert definition.name == "pdf-text-extract"
