@@ -868,68 +868,37 @@ async def proofread_body(blocks: list[BodyBlock]) -> list[TextEdit]:
 async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslation]:
     # 검증기와 같은 기준: 한문 위주 각주만 번역 대상이다.
     targets = [block for block in blocks if _is_hanja_footnote(block.text)]
+
+    async def _attempt_one(block: BodyBlock) -> HanjaTranslation | None:
+        listing = f"[{block.block_id}] {block.text}"
+        result = await _parse(_HanjaBatch, HANJA_TRANSLATE_PROMPT + listing)
+        for translation in result.translations:
+            matched = match_translation_to_block(translation, [block])
+            if matched is not None:
+                return translation.model_copy(
+                    update={"item_id": block.block_id}
+                )
+        return None
+
     translations: list[HanjaTranslation] = []
-    for chunk in _chunk(targets, LLM_CHUNK_SIZE):
-        listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
-
-        async def _attempt(items: list[BodyBlock]) -> list[HanjaTranslation]:
-            chunk_listing = "\n".join(
-                f"[{block.block_id}] {block.text}" for block in items
+    # 한 각주당 호출 하나: 항목이 독립적으로 처리되어 부분 누락이
+    # 재시도로 정확히 복구된다.
+    for block in targets:
+        got: HanjaTranslation | None = None
+        for attempt in range(3):
+            try:
+                got = await _attempt_one(block)
+                if got is not None:
+                    break
+            except Exception as error:
+                _log_llm_failure(f"한문 번역({block.block_id}, {attempt + 1}차)", error)
+        if got is None:
+            logging.getLogger(__name__).warning(
+                "한문 번역 최종 누락: %s (p%s)", block.block_id, block.page
             )
-            result = await _parse(
-                _HanjaBatch, HANJA_TRANSLATE_PROMPT + chunk_listing
-            )
-            return result.translations
-
-        try:
-            batch = await _attempt(chunk)
-            translations.extend(batch)
-            # 누락된 각주는 1회 재시도한다 (전수 번역 보장).
-            got_ids = {
-                match_translation_to_block(t, chunk).block_id
-                for t in batch
-                if match_translation_to_block(t, chunk) is not None
-            }
-            missing = [b for b in chunk if b.block_id not in got_ids]
-            if missing:
-                retry = await _attempt(missing)
-                translations.extend(retry)
-                retry_ids = {
-                    match_translation_to_block(t, missing).block_id
-                    for t in retry
-                    if match_translation_to_block(t, missing) is not None
-                }
-                still_missing = [b for b in missing if b.block_id not in retry_ids]
-                # 2차 재시도: 남은 항목을 한 건씩 개별 요청한다.
-                for block in still_missing:
-                    try:
-                        solo = await _attempt([block])
-                        translations.extend(solo)
-                    except Exception as error:
-                        _log_llm_failure("한문 번역(개별 재시도)", error)
-                final_ids = set()
-                for t in translations:
-                    matched = match_translation_to_block(t, chunk)
-                    if matched is not None:
-                        final_ids.add(matched.block_id)
-                unresolved = [
-                    b.block_id for b in chunk if b.block_id not in final_ids
-                ]
-                if unresolved:
-                    logging.getLogger(__name__).warning(
-                        "한문 번역 재시도 후에도 누락: %s", unresolved
-                    )
-        except Exception as error:
-            _log_llm_failure("한문 번역", error)
-    # 재시도로 생긴 중복을 블록별로 하나만 남긴다(상한 잘림 방지).
-    deduped: dict[str, HanjaTranslation] = {}
-    for translation in translations:
-        block = match_translation_to_block(translation, targets)
-        if block is not None and block.block_id not in deduped:
-            deduped[block.block_id] = translation.model_copy(
-                update={"item_id": block.block_id}
-            )
-    return _cap_translations(list(deduped.values()))
+        else:
+            translations.append(got)
+    return _cap_translations(translations)
 
 
 @workflows.activity(name="pdf-annotate-source-titles", start_to_close_timeout=LLM_TIMEOUT)
