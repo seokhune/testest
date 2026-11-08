@@ -794,3 +794,31 @@ def test_verifier_catches_fabricated_bibliography() -> None:
         [SourceAnnotation(item_id="p1", source="김부식, 《삼국사기》 권3 (추정)")],
     )
     assert any("원고에 없는 서지명" in e for e in bad)
+
+
+def test_verifier_accepts_skipped_edit_paragraph() -> None:
+    """교정이 건너뛰어져 원문이 남아 있어도 통과해야 한다 (오탐 방지)."""
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock, TextEdit
+    from worker.workflows.review_verifier import verify_review_docx
+
+    original = "왕이 삼군을 거느리고 개경으로 향하였다."
+    document = Document()
+    document.add_paragraph(original)  # 교정이 건너뛰어진 채 원문 그대로
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    blocks = [BodyBlock(block_id="p1", text=original, page=8)]
+    edits = [
+        TextEdit(
+            item_id="p1",
+            original=original,
+            revised=original.replace("개경으로", "개경(開京)으로"),
+            category="typo",
+            reason="한자 병기",
+        )
+    ]
+    errors = verify_review_docx(buffer.getvalue(), blocks, edits, [], [])
+    assert errors == []

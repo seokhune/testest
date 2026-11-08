@@ -56,8 +56,15 @@ def verify_review_docx(
     for block in blocks:
         if _is_hanja_footnote(block.text):
             continue  # 각주는 검사 2에서 본다
-        expected = revised_by_block.get(block.block_id) or block.text
-        if _norm(expected) and _norm(expected) not in whole_text:
+        original = _norm(block.text)
+        revised = _norm(revised_by_block.get(block.block_id) or "")
+        # 교정이 반영되었으면 수정문이, 가드 등으로 건너뛰어졌으면
+        # 원문이 있어야 한다. 둘 다 없어야 유실이다.
+        present = (original and original in whole_text) or (
+            revised and revised in whole_text
+        )
+        if not present:
+            expected = revised_by_block.get(block.block_id) or block.text
             missing_body.append(
                 f"본문 유실: {block.block_id} (p{block.page}) "
                 f"'{expected[:40]}…'"

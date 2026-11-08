@@ -576,14 +576,13 @@ BODY_PROOFREAD_PROMPT = """아래는 번역서 본문 문단 목록입니다.
 문단 목록:
 """
 
-HANJA_TRANSLATE_PROMPT = """아래는 번역서 문단 목록입니다. 한문(한자문)으로 작성된 주석만 골라 자연스러운 한국어로 번역하십시오.
+HANJA_TRANSLATE_PROMPT = """아래는 한문 원문 각주 목록입니다. 목록의 모든 항목을 빠짐없이 한국어로 번역하십시오.
 
 규칙:
-1. 한문 구절을 자연스러운 한국어로 번역하십시오.
-2. 한자가 일부 포함되었어도 대부분 한국어라면 번역하지 말고 건너뛰십시오.
-3. 결과가 없으면 빈 목록을 반환하십시오.
-4. translation에는 번역만 담고 원문 그대로는 포함하지 마십시오.
-5. item_id에는 해당 주석의 번호를 사용하십시오. 문단 텍스트에서 "N)" 형식의 주석 번호를 찾아 item_id를 "주석 N번"으로 지정하십시오. 주석 번호가 없으면 문단 번호를 그대로 사용하십시오.
+1. 목록에 있는 각주를 하나도 빠뜨리지 말고 전부 번역하십시오. [N]으로 표시된 항목 수와 번역 결과 수가 같아야 합니다.
+2. 한문 구절을 자연스러운 한국어로 번역하십시오.
+3. translation에는 번역만 담고 원문 그대로는 포함하지 마십시오.
+4. item_id에는 목록의 [N] 번호를 그대로 사용하십시오.
 
 각 항목은 item_id(주석 번호, 예: "주석 23번"), original(한문 구절이 포함된 문단 전체), translation(한문 번역)을 포함합니다.
 
@@ -836,13 +835,39 @@ async def proofread_body(blocks: list[BodyBlock]) -> list[TextEdit]:
 
 @workflows.activity(name="pdf-translate-hanja", start_to_close_timeout=LLM_TIMEOUT)
 async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslation]:
-    targets = [block for block in blocks if contains_hanja(block.text)]
+    # 검증기와 같은 기준: 한문 위주 각주만 번역 대상이다.
+    targets = [block for block in blocks if _is_hanja_footnote(block.text)]
     translations: list[HanjaTranslation] = []
     for chunk in _chunk(targets, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
+
+        async def _attempt(items: list[BodyBlock]) -> list[HanjaTranslation]:
+            chunk_listing = "\n".join(
+                f"[{block.block_id}] {block.text}" for block in items
+            )
+            result = await _parse(
+                _HanjaBatch, HANJA_TRANSLATE_PROMPT + chunk_listing
+            )
+            return result.translations
+
         try:
-            result = await _parse(_HanjaBatch, HANJA_TRANSLATE_PROMPT + listing)
-            translations.extend(result.translations)
+            batch = await _attempt(chunk)
+            translations.extend(batch)
+            # 누락된 각주는 1회 재시도한다 (전수 번역 보장).
+            got_ids = {t.item_id for t in batch}
+            missing = [b for b in chunk if b.block_id not in got_ids]
+            if missing:
+                retry = await _attempt(missing)
+                translations.extend(retry)
+                still_missing = [
+                    b.block_id
+                    for b in missing
+                    if b.block_id not in {t.item_id for t in retry}
+                ]
+                if still_missing:
+                    logging.getLogger(__name__).warning(
+                        "한문 번역 재시도 후에도 누락: %s", still_missing
+                    )
         except Exception as error:
             _log_llm_failure("한문 번역", error)
     return _cap_translations(translations)
