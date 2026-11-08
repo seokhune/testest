@@ -215,7 +215,12 @@ def test_insert_year_reports_places_full_report_at_year_ends() -> None:
     assert "2) 한문 번역 - 주석번역" in body_19
     assert "3) 본문-주석 내용 차이" in body_19
     assert "4) 주석 출처 보완 제안" in body_19
-    assert any("수정: 하왕이 폐세자를 서인으로 보내었다." in text for text in body_19)
+    # 교정 내역은 문단 전체가 아니라 변경 구간 발췌만 표시한다.
+    assert any("—수정:" in text for text in body_19)
+    # 발췌는 전체 문단보다 짧아야 한다
+    assert any(
+        len(text) < len("—수정: 하왕이 폐세자를 서인으로 보내었다.") for text in body_19 if text.startswith("—수정:")
+    )
     assert any("번역: 한문 번역문" in text for text in body_19)
     assert any("인용 불일치" in text for text in body_19)
     # 마지막 연도(20년) 리포트는 본문 끝에
@@ -476,3 +481,59 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
     assert "8~15페이지" in output.summary
     assert "내용 차이" in output.summary
     assert uploaded == ["조선사_p8-15_검수결과.docx"]
+
+
+def test_excerpt_edit_pair_shows_only_changed_span() -> None:
+    from worker.workflows.pdf_document_review import _excerpt_edit_pair
+
+    original = (
+        "왕이 삼군을 거느리고 개경으로 향하였다. 적병이 크게 궤멸되었다. "
+        "장군 흔달·견달 등 3천 2백인을 사로잡고, 5천 7백 급을 참수하였다."
+    )
+    revised = original.replace("3천 2백인", "3천 2백 명")
+    original_excerpt, revised_excerpt = _excerpt_edit_pair(original, revised)
+
+    # 전체 문단이 아니라 변경 구간 근처만 나와야 한다.
+    assert len(original_excerpt) <= 160
+    assert "3천 2백인" in original_excerpt
+    assert "3천 2백 명" in revised_excerpt
+    assert "왕이 삼군을 거느리고 개경으로 향하였다" not in original_excerpt
+
+
+def test_excerpt_edit_pair_handles_identical_text() -> None:
+    from worker.workflows.pdf_document_review import _excerpt_edit_pair
+
+    original_excerpt, revised_excerpt = _excerpt_edit_pair("동일 문단", "동일 문단")
+    assert original_excerpt == revised_excerpt == "동일 문단"
+
+
+def test_year_report_edits_use_excerpts_not_full_paragraphs() -> None:
+    from worker.workflows.pdf_document_review import _year_reports
+
+    long_text = (
+        "앞부분 문맥이 매우 길게 이어지는 문단이다. " * 5
+        + "중간의 오타를 고친다. "
+        + "뒷부분 문맥도 매우 길게 이어진다. " * 5
+    )
+    section = {
+        "year": "태조 19년(임신)",
+        "edits": [
+            TextEdit(
+                item_id="p1",
+                original=long_text.replace("오타를", "오타아를"),
+                revised=long_text,
+                category="typo",
+                reason="오타",
+            )
+        ],
+        "translations": [],
+        "differences": [],
+        "annotations": [],
+    }
+    lines = _year_reports(section)
+    joined = "\n".join(lines)
+    assert "—원문: " in joined and "—수정: " in joined
+    # 문단 전체가 그대로 들어가면 안 된다.
+    assert long_text not in joined
+    assert "오타아를" in joined
+    assert "오타를 고친다" in joined

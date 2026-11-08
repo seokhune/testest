@@ -223,6 +223,65 @@ def _norm_for_match(text: str) -> str:
     return "".join(text.split())
 
 
+# 같은 문단 안에서 문단 전체가 아닌 변경 구간 발췌만 보여주기 위한 설정
+EXCERPT_CONTEXT = 12  # 변경 지점 앞/뒤 문맥 문자 수
+EXCERPT_MAX = 160  # 발췌 최대 길이
+
+
+def _excerpt(text: str, start: int, end: int) -> str:
+    """text[start:end] 변경 구간을 앞/뒤 문맥으로 감싸 발췌한다."""
+    text = text.strip()
+    if not text:
+        return ""
+    left = max(0, start - EXCERPT_CONTEXT)
+    right = min(len(text), end + EXCERPT_CONTEXT)
+    excerpt = text[left:right].strip()
+    if len(excerpt) > EXCERPT_MAX:
+        excerpt = excerpt[:EXCERPT_MAX].rstrip() + "…"
+    prefix = "…" if left > 0 else ""
+    suffix = "…" if right < len(text) else ""
+    return f"{prefix}{excerpt}{suffix}"
+
+
+def _excerpt_edit_pair(original: str, revised: str) -> tuple[str, str]:
+    """original/revised 전체 문단에서 변경된 부분만 발췌하여 (original 발췌, revised 발췌)를 반환한다.
+
+    SequenceMatcher로 변경 구간을 찾아 그 구간 주변만 보여준다. 원문/수정본 일치도가
+    너무 낮으면 앞부분 중심 발췌로 대신한다.
+    """
+    import difflib
+
+    original = (original or "").strip()
+    revised = (revised or "").strip()
+    if not original or not revised:
+        return original[:EXCERPT_MAX], revised[:EXCERPT_MAX]
+
+    matcher = difflib.SequenceMatcher(None, original, revised, autojunk=False)
+    first_change = None
+    last_change = None
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            if first_change is None:
+                first_change = (i1, j1)
+            last_change = (i2, j2)
+    if first_change is None:
+        # 차이가 없음(중복 교정 등) - 앞 부분 발췌
+        return _excerpt(original, 0, EXCERPT_MAX), _excerpt(revised, 0, EXCERPT_MAX)
+
+    if last_change[0] - first_change[0] > EXCERPT_MAX * 3:
+        # 변경 구간이 지나치게 넓음 - 첫 변경 지점 중심 발췌
+        mid = (first_change[0] + last_change[0]) // 2
+        return _excerpt(original, mid - 8, mid + 8), _excerpt(
+            revised, (first_change[1] + last_change[1]) // 2 - 8,
+            (first_change[1] + last_change[1]) // 2 + 8,
+        )
+
+    return (
+        _excerpt(original, first_change[0], last_change[0]),
+        _excerpt(revised, first_change[1], last_change[1]),
+    )
+
+
 def _year_reports(section: dict) -> list:
     year = section["year"]
     edits = section["edits"]
@@ -239,8 +298,9 @@ def _year_reports(section: dict) -> list:
     ]
     if edits:
         for edit in edits:
-            lines.append(f"—원문: {edit.original}")
-            lines.append(f"—수정: {edit.revised}")
+            original_excerpt, revised_excerpt = _excerpt_edit_pair(edit.original, edit.revised)
+            lines.append(f"—원문: {original_excerpt}")
+            lines.append(f"—수정: {revised_excerpt}")
     else:
         lines.append("수정된 문단이 없습니다.")
     lines.append("2) 한문 번역 - 주석번역")
