@@ -705,3 +705,92 @@ def test_docx_patch_section3_replaces_whole_block() -> None:
         < texts.index("· 매핑 검수 차이 1")
         < texts.index(SECTION4_HEADING)
     )
+
+
+def test_verifier_catches_truncated_body_and_missing_translation() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock, TextEdit, HanjaTranslation
+    from worker.workflows.review_verifier import verify_review_docx
+
+    body_text = "적병이 크게 궤멸되었다. 장군 흔달(昕達)·견달(見達) 등 3천 2백인을 사로잡았다."
+    footnote_text = "27) 八月五日乙酉 太保內史令徐熙卒"
+
+    def _build(include_body: bool, include_footnote: bool) -> bytes:
+        document = Document()
+        if include_body:
+            document.add_paragraph(body_text)
+        if include_footnote:
+            document.add_paragraph(footnote_text)
+        buffer = io.BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    blocks = [
+        BodyBlock(block_id="p1", text=body_text, page=10),
+        BodyBlock(block_id="p2", text=footnote_text, page=10),
+    ]
+    translations = [HanjaTranslation(item_id="p2", original=footnote_text, translation="번역")]
+
+    # 온전한 문서 → 통과
+    ok = verify_review_docx(
+        _build(include_body=True, include_footnote=True), blocks, [], translations, []
+    )
+    assert ok == []
+
+    # 본문이 잘린 문서 → 본문 유실로 실패 (152자 절단 사고 방지)
+    truncated = verify_review_docx(
+        _build(include_body=False, include_footnote=True), blocks, [], translations, []
+    )
+    assert any("본문 유실" in e for e in truncated)
+
+    # 각주가 사라진 문서 → 각주 유실로 실패
+    no_footnote = verify_review_docx(
+        _build(include_body=True, include_footnote=False), blocks, [], translations, []
+    )
+    assert any("각주 유실" in e for e in no_footnote)
+
+    # 번역이 누락된 경우 → 번역 누락으로 실패
+    no_translation = verify_review_docx(
+        _build(include_body=True, include_footnote=True), blocks, [], [], []
+    )
+    assert any("번역 누락" in e for e in no_translation)
+
+
+def test_verifier_catches_fabricated_bibliography() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock, SourceAnnotation
+    from worker.workflows.review_verifier import verify_review_docx
+
+    body_text = "석경당이 거란 군대로써 후당을 찬탈하고, 국호를 진이라고 하였다.(구오대사 권75)"
+    document = Document()
+    document.add_paragraph(body_text)
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    blocks = [BodyBlock(block_id="p1", text=body_text, page=13)]
+
+    # 원고에 있는 서지명(구오대사) → 통과
+    ok = verify_review_docx(
+        buffer.getvalue(),
+        blocks,
+        [],
+        [],
+        [],
+        [SourceAnnotation(item_id="p1", source="『구오대사』 권75 출전 누락")],
+    )
+    assert not any("원고에 없는 서지명" in e for e in ok)
+
+    # 원고에 없는 서지명(삼국사기) → 실패
+    bad = verify_review_docx(
+        buffer.getvalue(),
+        blocks,
+        [],
+        [],
+        [],
+        [SourceAnnotation(item_id="p1", source="김부식, 《삼국사기》 권3 (추정)")],
+    )
+    assert any("원고에 없는 서지명" in e for e in bad)

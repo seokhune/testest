@@ -969,6 +969,26 @@ async def build_result_docx(
         )
 
     final = await asyncio.to_thread(insert_year_reports, edited, year_sections)
+
+    # 품질 검증(무검증 비용): 통과해야만 업로드된다. 결함이 있으면
+    # 실행이 실패하고 원인 목록이 에러 메시지에 담긴다.
+    from worker.workflows.review_verifier import verify_review_docx
+
+    verification_errors = await asyncio.to_thread(
+        verify_review_docx,
+        final,
+        blocks,
+        flat_edits,
+        flat_translations,
+        year_sections,
+        source_annotations,
+    )
+    if verification_errors:
+        raise workflows.WorkflowError(
+            "출력 품질 검증 실패 (업로드 중단): "
+            + "; ".join(verification_errors[:10]),
+            non_retryable=True,
+        )
     return base64.b64encode(final).decode()
 
 
