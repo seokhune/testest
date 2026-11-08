@@ -358,7 +358,9 @@ def _year_reports(section: dict) -> list:
         for difference in diffs:
             lines.append(f"· {difference.difference}")
     else:
-        lines.append("본문-주석 내용 차이가 없습니다.")
+        lines.append(
+            "※ 본문-주석 내용 차이 검수는 각주 번호 1:1 매핑 검사(별도 수행)로 진행합니다."
+        )
     lines.append("4) 주석 출처 보완 제안")
     if annotations:
         for annotation in annotations:
@@ -1033,7 +1035,10 @@ class PdfDocumentReviewWorkflow:
         source_annotations = await _guarded(
             "주석 출처 판독", annotate_footnote_sources(blocks)
         )
-        differences = await _guarded("본문-주석 비교", compare_quotes(blocks))
+        # 본문-주석 내용 차이는 워크플로우에서 수행하지 않는다.
+        # 페이지 단위 LLM 비교가 각주 번호 미매핑 환각을 일으켰기 때문에,
+        # 이 검사는 Work의 joseonsa-body-footnote-diff 스킬(각주 번호 1:1 매핑)이 담당한다.
+        differences = []
 
         body_edits = reconcile_edits(blocks, body_edits)
         hanja_translations = reconcile_translations(blocks, hanja_translations)
