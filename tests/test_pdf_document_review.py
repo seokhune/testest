@@ -843,3 +843,34 @@ def test_reconcile_translations_matches_by_footnote_number() -> None:
     result = reconcile_translations(blocks, translations)
     assert len(result) == 1
     assert result[0].item_id == "p3"
+
+
+def test_block_id_number_does_not_hijack_translation() -> None:
+    """'p3'(각주 2번 블록)의 번역이 각주 3번 블록으로 훔쳐지면 안 된다."""
+    from worker.workflows.hwp_review_models import BodyBlock, HanjaTranslation
+    from worker.workflows.pdf_document_review import (
+        match_translation_to_block,
+        reconcile_translations,
+    )
+
+    blocks = [
+        BodyBlock(block_id="p3", text="2) 丙申十九年 春二月 朴英規請降", page=8),
+        BodyBlock(block_id="p5", text="3) 十九年春二月 朴英規請內附", page=8),
+    ]
+    # LLM이 지시대로 item_id에 블록 ID 'p3'를 적고 원문에서 번호를 뺀 경우
+    translation = HanjaTranslation(
+        item_id="p3",
+        original="丙申十九年 春二月 朴英規請降",
+        translation="병신 19년 봄 2월에 박영규가 항복을 청하였다.",
+    )
+    assert match_translation_to_block(translation, blocks).block_id == "p3"
+    result = reconcile_translations(blocks, [translation])
+    assert result[0].item_id == "p3"
+
+    # 원문에 각주 번호가 있으면 그 번호가 우선한다
+    numbered = HanjaTranslation(
+        item_id="주석 2번",
+        original="2) 丙申十九年 春二月 朴英規請降",
+        translation="병신 19년 봄 2월에 박영규가 항복을 청하였다.",
+    )
+    assert match_translation_to_block(numbered, blocks).block_id == "p3"

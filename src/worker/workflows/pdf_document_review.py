@@ -532,30 +532,45 @@ def match_translation_to_block(
     LLM이 item_id를 다양한 형식('p27', '27', '주석 27번')으로 적어도
     각주 번호 기반으로 찾아낸다. 못 찾으면 텍스트 일치로 찾는다.
     """
-    # 각주 번호가 가장 신뢰할 수 있는 단서다(문맥상 각주 번호는 유일하다).
-    # LLM이 item_id를 잘못 적어도 각주 번호로 정확히 찾는다.
-    id_number = re.search(r"(\d{1,3})", translation.item_id or "")
+    # 1) 원문의 각주 번호가 가장 신뢰할 수 있는 단서다('2) 丙申…').
     original_number = _footnote_number(translation.original or "")
-    for number in (original_number, id_number.group(1) if id_number else None):
-        if not number:
-            continue
+    if original_number:
         try:
-            wanted = int(number)
+            wanted = int(original_number)
+            for candidate in blocks:
+                candidate_number = _footnote_number(candidate.text)
+                if candidate_number and int(candidate_number) == wanted:
+                    return candidate
         except ValueError:
-            continue
-        for candidate in blocks:
-            candidate_number = _footnote_number(candidate.text)
-            if candidate_number and int(candidate_number) == wanted:
-                return candidate
+            pass
+    # 2) 블록 ID 정확 일치. 주의: 블록 ID('p3')에 들어간 숫자를 각주
+    #    번호로 해석하면 안 된다 — 각주 3번은 다른 블록이다.
     by_id = {block.block_id: block for block in blocks}
     block = by_id.get(translation.item_id)
     if block is not None:
         return block
-    # 텍스트 일치(접두사)로 찾는다
+    # 3) item_id가 '주석 2번', '2'처럼 각주 번호를 직접 가리킬 때만
+    #    번호 매칭을 쓴다('p3' 형태는 2)에서 이미 처리했다).
+    if not re.fullmatch(r"p\d+", (translation.item_id or "").strip()):
+        id_number = re.search(r"(\d{1,3})", translation.item_id or "")
+        if id_number:
+            try:
+                wanted = int(id_number.group(1))
+                for candidate in blocks:
+                    candidate_number = _footnote_number(candidate.text)
+                    if candidate_number and int(candidate_number) == wanted:
+                        return candidate
+            except ValueError:
+                pass
+    # 4) 텍스트 접두사 대조. 블록 쪽에서는 각주 번호 표기('2) ')를
+    #    떼고 비교한다(LLM이 번호를 빼고 원문을 �려주는 경우 대비).
     needle = _norm_text(translation.original or "")[:60]
     if needle:
         for candidate in blocks:
-            if _norm_text(candidate.text).startswith(needle):
+            stripped = re.sub(r"^\s*\d{1,3}\s*\)\s*", "", candidate.text)
+            if _norm_text(candidate.text).startswith(needle) or _norm_text(
+                stripped
+            ).startswith(needle):
                 return candidate
     return None
 
