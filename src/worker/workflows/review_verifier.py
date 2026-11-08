@@ -20,13 +20,16 @@ import re
 
 
 import re as _re
+import unicodedata
 
 # 한자·비표준 인코딩 영역: PDF 엔진(pypdf/pdf2docx)마다 추출이 달라지는 글자들
 _HANJA_RE = _re.compile(r"[\u3000-\u9fff\u3400-\u4dbf\uf000-\ufaff\ufe30-\ufe4f]")
 
 
 def _norm(text: str) -> str:
-    return "".join((text or "").split())
+    # NFC 정규화: 오래된 한글 PDF는 엔진마다 조합형/완성형 유니코드가 달라
+    # 문자열 대조가 실패할 수 있다.
+    return unicodedata.normalize("NFC", "".join((text or "").split()))
 
 
 def _korean_only(text: str) -> str:
