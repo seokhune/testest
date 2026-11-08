@@ -1177,18 +1177,29 @@ class PdfDocumentReviewWorkflow:
             stats,
         ))
 
-        if verification_errors:
-            raise workflows.WorkflowError(
-                "출력 품질 검증 실패 (업로드 중단): "
-                + " | ".join(verification_errors[:15]),
-                non_retryable=True,
-            )
-
         range_suffix = ""
         if data.page_start is not None or data.page_end is not None:
             range_start = data.page_start or 1
             range_end = data.page_end or total_pages
             range_suffix = f"_p{range_start}-{range_end}"
+
+        if verification_errors:
+            # 결함이 있어도 초안을 업로드한다 — 수리 스킬이 그 자리에서 고친다.
+            # 파일명에 결함 포함 표시를 남기고 결함 목록을 요약에 담는다.
+            draft_title = f"{stem}{range_suffix}_검수초안_결함포함.docx"
+            draft_file = await upload_drive_file(
+                draft_title, result_b64, output_parent_id
+            )
+            return PdfReviewOutput(
+                source_title=source.title,
+                result_file=draft_file,
+                stats={**stats, "verification_defects": len(verification_errors)},
+                summary=(
+                    f"구간 초안(결함 {len(verification_errors)}개 포함)을 업로드했습니다. "
+                    "수리 대상 결함 목록: "
+                    + " | ".join(verification_errors[:15])
+                ),
+            )
 
         result_file = await upload_drive_file(
             f"{stem}{range_suffix}_검수결과.docx", result_b64, output_parent_id
