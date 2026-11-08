@@ -550,17 +550,41 @@ def apply_edits_by_text(
         if match_index is None:
             continue
         paragraph_text = _element_text(paragraphs[match_index])
+        block_text = block_text_by_id.get(edit.item_id) or edit.original
+
+        # 삭제 가드는 '블록 분량' 기준으로 판정한다.
         matcher = difflib.SequenceMatcher(
-            None, paragraph_text, edit.revised, autojunk=False
+            None, block_text, edit.revised, autojunk=False
         )
         deleted = sum(
             i2 - i1
             for tag, i1, i2, _j1, _j2 in matcher.get_opcodes()
             if tag in ("delete", "replace")
         )
-        if deleted > max(30, int(len(paragraph_text) * 0.3)):
+        if deleted > max(30, int(len(block_text) * 0.3)):
             continue
-        _apply_text_edit(paragraphs[match_index], edit.revised)
+
+        # pdf2docx가 여러 블록을 한 문단으로 합친 경우, 블록 뒤의 꼬리는
+        # 그대로 보존하고 블록 부분만 교체한다. (문단 증발 방지)
+        norm_paragraph = _norm(paragraph_text)
+        norm_block = _norm(block_text)
+        if norm_paragraph == norm_block or not norm_block:
+            target_text = edit.revised
+        else:
+            raw_end = None
+            consumed: list[str] = []
+            for index, char in enumerate(paragraph_text):
+                if char.strip():
+                    consumed.append(char)
+                if "".join(consumed) == norm_block:
+                    raw_end = index + 1
+                    break
+            if raw_end is None:
+                # 블록 경계를 못 찾으면 안전하게 건너뛴다.
+                continue
+            target_text = edit.revised + paragraph_text[raw_end:]
+
+        _apply_text_edit(paragraphs[match_index], target_text)
         used.add(match_index)
         applied += 1
 

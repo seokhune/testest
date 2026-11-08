@@ -573,3 +573,71 @@ def test_fabricated_source_filter() -> None:
     assert _is_fabricated_source("이긍익, 『연려실기술』 권1, 탐구당, 1976")
     assert not _is_fabricated_source("『구오대사』 권21 태조 19년 조에 출전 누락")
     assert not _is_fabricated_source("주석 7번의 출전 표기에서 서지명이 빠져 있다")
+
+
+def test_hanja_footnototes_excluded_from_proofreading() -> None:
+    from worker.workflows.pdf_document_review import _is_hanja_footnote
+
+    # 한문 원문 각주는 교정 대상에서 제외
+    assert _is_hanja_footnote("27) 八月五日乙酉 太保內史令徐熙卒")
+    assert _is_hanja_footnote("13) 九月, 王率三軍 出征")
+    # 한국어 역자 주는 유지
+    assert not _is_hanja_footnote("5) <역자 주> 이 부분은 원문의 표기를 따랐다.")
+    # 본문은 유지
+    assert not _is_hanja_footnote("왕이 삼군을 거느리고 개경으로 향하였다.")
+
+
+def test_annotation_report_uses_footnote_number() -> None:
+    from worker.workflows.hwp_review_models import SourceAnnotation
+    from worker.workflows.pdf_document_review import _year_reports
+
+    section = {
+        "year": "태조 19년(임신)",
+        "edits": [],
+        "translations": [],
+        "differences": [],
+        "annotations": [
+            SourceAnnotation(item_id="p56", source="『구오대사』 권4 출전 누락", footnote_number="7"),
+            SourceAnnotation(item_id="p99", source="서지명이 빠져 있다"),
+        ],
+    }
+    lines = _year_reports(section)
+    joined = "\n".join(lines)
+    assert "[주석 7번] 출처:" in joined
+    assert "[p99] 출처:" in joined
+
+
+def test_apply_edits_preserves_merged_paragraph_tail() -> None:
+    """pdf2docx가 두 블록을 한 문단으로 합친 경우 꼬리가 증발하지 않는지 검증한다."""
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_docx import apply_edits_by_text
+    from worker.workflows.hwp_review_models import BodyBlock
+
+    document = Document()
+    # pypdf는 【황산】을 기준으로 두 블록으로 쪼갰지만 DOCX 문단은 하나다.
+    block_text = "적병이 크게 궤멸되었다. 장군 흔달(昕達)·견달(見達) 등 3천 2백인을 사로잡고,"
+    tail_text = " 5천 7백 급을 참수하였다. 【황산】 적병이 궤멸되어 패주하였다."
+    merged = block_text + tail_text
+    document.add_paragraph(merged)
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    blocks = [BodyBlock(block_id="p23", text=block_text, page=10)]
+    edits = [
+        TextEdit(
+            item_id="p23",
+            original=block_text,
+            revised=block_text.replace("3천 2백인", "3천 2백 명"),
+            category="typo",
+            reason="띄어쓰기",
+        )
+    ]
+    result, applied = apply_edits_by_text(buffer.getvalue(), edits, [], blocks)
+    document = Document(io.BytesIO(result))
+    text = document.paragraphs[0].text
+    assert applied == 1
+    assert "3천 2백 명" in text
+    # 꼬리 전체가 살아 있어야 한다 (135자 증발 사고 방지)
+    assert "5천 7백 급을 참수하였다. 【황산】 적병이 궤멸되어 패주하였다." in text

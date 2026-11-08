@@ -52,6 +52,7 @@ class TextEdit(pydantic.BaseModel):
 class SourceAnnotation(pydantic.BaseModel):
     item_id: str
     source: str
+    footnote_number: str | None = None
 
     @pydantic.field_validator("item_id", mode="before")
     @classmethod

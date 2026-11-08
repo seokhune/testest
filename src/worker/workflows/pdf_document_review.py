@@ -362,7 +362,12 @@ def _year_reports(section: dict) -> list:
     lines.append("4) 주석 출처 보완 제안")
     if annotations:
         for annotation in annotations:
-            lines.append(f"· [주석 {annotation.item_id}] 출처: {annotation.source}")
+            label = (
+                f"주석 {annotation.footnote_number}번"
+                if annotation.footnote_number
+                else annotation.item_id
+            )
+            lines.append(f"· [{label}] 출처: {annotation.source}")
     else:
         lines.append("주석 출처 보완 대상이 없습니다.")
     return lines
@@ -798,10 +803,26 @@ async def load_pages(
     return await asyncio.to_thread(_extract)
 
 
+def _is_hanja_footnote(text: str) -> bool:
+    """한문 위주의 각주 블록 판정 - 본문 교정 대상에서 제외한다.
+
+    교수 지침: 한문 원문 각주를 한국어 번역문으로 바꾸는 교정을 제안하지 않는다.
+    각주 줄('27) ...')이면서 한문 비중이 높으면 제외한다. 한국어 역자 주는 유지한다.
+    """
+    stripped = (text or "").strip()
+    if not FOOTNOTE_LINE_RE.match(stripped):
+        return False
+    hanja = sum(1 for ch in stripped if "\u4e00" <= ch <= "\u9fff")
+    return hanja >= max(4, len(stripped) * 0.3)
+
+
 @workflows.activity(name="pdf-proofread-body", start_to_close_timeout=LLM_TIMEOUT)
 async def proofread_body(blocks: list[BodyBlock]) -> list[TextEdit]:
     edits: list[TextEdit] = []
-    for chunk in _chunk(blocks, LLM_CHUNK_SIZE):
+    proofread_blocks = [
+        block for block in blocks if not _is_hanja_footnote(block.text)
+    ]
+    for chunk in _chunk(proofread_blocks, LLM_CHUNK_SIZE):
         listing = "\n".join(f"[{block.block_id}] {block.text}" for block in chunk)
         try:
             result = await _parse(_EditBatch, BODY_PROOFREAD_PROMPT + listing)
@@ -861,6 +882,13 @@ async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnot
             annotations.extend(result.annotations)
         except Exception as error:
             _log_llm_failure("주석 출처 판독", error)
+    # 각주 번호('27) ...')를 블록 텍스트에서 추출해 리포트 라벨로 쓴다.
+    block_text_by_id = {block.block_id: block.text for block in blocks}
+    for annotation in annotations:
+        block_text = block_text_by_id.get(annotation.item_id, "")
+        number_match = re.match(r"^\s*(\d{1,3})\s*\)", (block_text or "").strip())
+        if number_match:
+            annotation.footnote_number = number_match.group(1)
     # '원고에 없는 자료 금지'를 프롬프트만 믿지 말고 코드로 검사한다.
     kept = [a for a in annotations if not _is_fabricated_source(a.source)]
     dropped = len(annotations) - len(kept)
