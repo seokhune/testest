@@ -518,24 +518,49 @@ def reconcile_edits(
     return list(matched.values())
 
 
+def _footnote_number(text: str) -> str | None:
+    """'27) 八月…' 형태에서 각주 번호('27')를 뽑는다."""
+    match = re.match(r"^\s*(\d{1,3})\s*\)", (text or "").strip())
+    return match.group(1) if match else None
+
+
+def match_translation_to_block(
+    translation: HanjaTranslation, blocks: list[BodyBlock]
+) -> BodyBlock | None:
+    """번역 항목을 원본 블록에 연결한다.
+
+    LLM이 item_id를 다양한 형식('p27', '27', '주석 27번')으로 적어도
+    각주 번호 기반으로 찾아낸다. 못 찾으면 텍스트 일치로 찾는다.
+    """
+    by_id = {block.block_id: block for block in blocks}
+    block = by_id.get(translation.item_id)
+    if block is not None:
+        return block
+    # item_id에서 숫자 추출 ('주석 27번' → '27')
+    id_number = re.search(r"(\d{1,3})", translation.item_id or "")
+    original_number = _footnote_number(translation.original or "")
+    for number in (original_number, id_number.group(1) if id_number else None):
+        if not number:
+            continue
+        for candidate in blocks:
+            if _footnote_number(candidate.text) == number:
+                return candidate
+    # 텍스트 일치(접두사)로 찾는다
+    needle = _norm_text(translation.original or "")[:60]
+    if needle:
+        for candidate in blocks:
+            if _norm_text(candidate.text).startswith(needle):
+                return candidate
+    return None
+
+
 def reconcile_translations(
     blocks: list[BodyBlock], translations: list[HanjaTranslation]
 ) -> list[HanjaTranslation]:
     """LLM 한문 번역 항목을 블록에 정합한다 (reconcile_edits와 같은 규칙)."""
-    by_id = {block.block_id: block for block in blocks}
-    by_text = {_norm_text(block.text): block for block in blocks}
     matched: dict[str, HanjaTranslation] = {}
     for translation in translations:
-        block = by_id.get(translation.item_id)
-        if block is None:
-            block = by_text.get(_norm_text(translation.original))
-        if block is None:
-            needle = _norm_text(translation.original)[:60]
-            if needle:
-                for candidate in blocks:
-                    if _norm_text(candidate.text).startswith(needle):
-                        block = candidate
-                        break
+        block = match_translation_to_block(translation, blocks)
         if block is None:
             continue
         matched[block.block_id] = translation.model_copy(
@@ -854,7 +879,11 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
             batch = await _attempt(chunk)
             translations.extend(batch)
             # 누락된 각주는 1회 재시도한다 (전수 번역 보장).
-            got_ids = {t.item_id for t in batch}
+            got_ids = {
+                match_translation_to_block(t, chunk).block_id
+                for t in batch
+                if match_translation_to_block(t, chunk) is not None
+            }
             missing = [b for b in chunk if b.block_id not in got_ids]
             if missing:
                 retry = await _attempt(missing)

@@ -822,3 +822,24 @@ def test_verifier_accepts_skipped_edit_paragraph() -> None:
     ]
     errors = verify_review_docx(buffer.getvalue(), blocks, edits, [], [])
     assert errors == []
+
+
+def test_reconcile_translations_matches_by_footnote_number() -> None:
+    """LLM이 item_id를 '주석 2번' 등으로 적어도 각주 번호로 매칭되어야 한다."""
+    from worker.workflows.hwp_review_models import BodyBlock, HanjaTranslation
+    from worker.workflows.pdf_document_review import reconcile_translations
+
+    blocks = [
+        BodyBlock(block_id="p3", text="2) 丙申十九年 春二月 珍熋女堧將軍朴英規請降", page=8),
+        BodyBlock(block_id="p7", text="본문 문단이다. 왕이 삼군을 거느렸다.", page=8),
+    ]
+    translations = [
+        HanjaTranslation(
+            item_id="주석 2번",
+            original="丙申十九年 春二月 珍熋女堧將軍朴英規請降",
+            translation="병신 19년 봄 2월에 진선의 장군 박영규가 항복을 청하였다.",
+        )
+    ]
+    result = reconcile_translations(blocks, translations)
+    assert len(result) == 1
+    assert result[0].item_id == "p3"
