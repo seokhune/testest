@@ -57,7 +57,8 @@ def test_blocks_from_pages_merges_lines_into_paragraphs() -> None:
 
 def test_detect_year_reads_reign_year_headings() -> None:
     assert detect_year("태종 6년(무인) 봄 정월에 ...") == "태종 6년(무인)"
-    assert detect_year("2\n6년(임오) 상왕이 ...") == "6년(임오)"
+    # 왕호 없이 시작하는 조각은 헤딩이 아니다 (오탐 방지)
+    assert detect_year("2\n6년(임오) 상왕이 ...") is None
     assert detect_year("태조 원년 임신에 ...") == "태조 원년"
     assert detect_year("그해 겨울에 큰 눈이 내렸다.") is None
 
@@ -537,3 +538,38 @@ def test_year_report_edits_use_excerpts_not_full_paragraphs() -> None:
     assert long_text not in joined
     assert "오타아를" in joined
     assert "오타를 고친다" in joined
+
+
+def test_detect_year_ignores_footnote_and_inline_years() -> None:
+    from worker.workflows.pdf_document_review import detect_year
+
+    # 진짜 헤딩
+    assert detect_year("태조 19년(임신) 정월에 하왕이 즉위하였다.") == "태조 19년(임신)"
+    assert detect_year("태조 20년(계유) 봄 정월") == "태조 20년(계유)"
+    # 각주 내부 연도 (오탐이면 안 됨)
+    assert detect_year("(구오대사) 청태(淸泰)2년에 ...") is None
+    assert detect_year("31) ... 청태 3년 ...") is None
+    assert detect_year("27) 八月五日乙酉 ...") is None
+    # 문단 중간의 연도
+    assert detect_year("이해는 일본 스자쿠(朱雀) 2년이다.") is None
+    assert detect_year("왕이 즉위한 지 2년이 되었다.") is None
+
+
+def test_footnote_label_uses_footnote_number() -> None:
+    from worker.workflows.pdf_document_review import _footnote_label
+
+    assert _footnote_label("p54", "27) 八月五日乙酉 ...") == "주석 27번"
+    assert _footnote_label("p58", "  13) 漢文 원문") == "주석 13번"
+    assert _footnote_label("p99", "각주 번호 없는 발췌") == "p99"
+
+
+def test_fabricated_source_filter() -> None:
+    from worker.workflows.pdf_document_review import _is_fabricated_source
+
+    assert _is_fabricated_source(
+        "김종서 외, 『고려사』, 서울: 동국대학교출판부, 2003, 45쪽.(추정)"
+    )
+    assert _is_fabricated_source("(박사학위논문, 서울대학교대학원, 2014, pp. 120-121)")
+    assert _is_fabricated_source("이긍익, 『연려실기술』 권1, 탐구당, 1976")
+    assert not _is_fabricated_source("『구오대사』 권21 태조 19년 조에 출전 누락")
+    assert not _is_fabricated_source("주석 7번의 출전 표기에서 서지명이 빠져 있다")

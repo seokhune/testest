@@ -10,6 +10,7 @@ base64 2MB 전송 한도보다 큰 파일도 처리할 수 있다.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import timedelta
 from typing import Any
@@ -133,17 +134,34 @@ def blocks_from_pages(pages: list[tuple[int, str]]) -> list[BodyBlock]:
     return blocks
 
 
-YEAR_RE = re.compile(r"\d{1,3}\s*년\s*\([^)]*\)|\d{1,3}\s*년|원년")
+# 고려·조선 왕호 (년도 헤딩은 반드시 왕호 + 년수 형태로 시작한다)
+KING_NAMES = (
+    "태조|혜종|정종|광종|경종|성종|목종|현종|덕종|숙종|예종|문종|순종|선종|헌종|"
+    "인종|의종|명종|신종|희종|강종|고종|원종|충렬왕|충선왕|충숙왕|충혜왕|충목왕|"
+    "충정왕|공민왕|공양왕|세종|단종|세조|연산군|중종|선조|광해군|인조|효종|"
+    "영조|정조|순조|철종|순종|태종"
+)
+# 헤딩 판정: 문단 맨 앞이 '왕호 + 년수(간지)' 로 시작해야 한다.
+YEAR_HEADING_RE = re.compile(
+    rf"^(?:{KING_NAMES})\s*(?:\d{{1,3}}\s*년(?:\s*\([^)]*\))?|원년)"
+)
 
 
 def detect_year(text: str) -> str | None:
-    """문단에서 년도 표기(예: '태종 6년(무인)')를 찾아 라벨로 반환한다."""
-    match = YEAR_RE.search(text[:60])
+    """문단이 년도 헤딩(예: '태조 19년(임신)')으로 시작하는 경우에만 라벨로 반환한다.
+
+    오탐 방지 규칙:
+    - 문단 맨 앞에서 '왕호 + 년수' 형태로 시작해야 한다 (각주·인용문 내부의
+      '청태 2년', '2년' 같은 연도는 문단 중간에 있으므로 제외된다).
+    - 각주 줄('27) ...' 형태)은 헤딩이 될 수 없다.
+    """
+    stripped = text.strip()
+    if FOOTNOTE_LINE_RE.match(stripped):
+        return None
+    match = YEAR_HEADING_RE.match(stripped)
     if not match:
         return None
-    prefix = text[: match.start()]
-    king = re.search(r"[가-힣]{1,4}\s*$", prefix)
-    return ((king.group(0) if king else "") + match.group(0)).strip()
+    return match.group(0).strip()
 
 
 def group_by_year(
@@ -282,6 +300,17 @@ def _excerpt_edit_pair(original: str, revised: str) -> tuple[str, str]:
     )
 
 
+def _footnote_label(block_id: str, original_text: str) -> str:
+    """주석 발췌 앞의 각주 번호('27) ...')를 찾아 '주석 27번' 라벨을 만든다.
+
+    각주 번호를 못 찾으면 블록 ID로 대신한다.
+    """
+    match = re.match(r"^\s*(\d{1,3})\s*\)", (original_text or "").strip())
+    if match:
+        return f"주석 {match.group(1)}번"
+    return block_id
+
+
 def _year_reports(section: dict) -> list:
     year = section["year"]
     edits = section["edits"]
@@ -306,7 +335,8 @@ def _year_reports(section: dict) -> list:
     lines.append("2) 한문 번역 - 주석번역")
     if translations:
         for translation in translations:
-            lines.append(f"· 원문 - **{translation.item_id}**: {translation.original}")
+            label = _footnote_label(translation.item_id, translation.original)
+            lines.append(f"· 원문 - **{label}**: {translation.original}")
             lines.append(f"  번역: {translation.translation}")
     else:
         lines.append("한문 번역 대상이 없습니다.")
@@ -593,6 +623,19 @@ MAX_EDITS = 40
 MAX_TRANSLATIONS = 40
 MAX_DIFFERENCES = 20
 MAX_ANNOTATIONS = 40
+# 원고에 존재할 수 없는 현대 서지 표기 - LLM이 지어낸 출처를 코드 레벨에서 차단한다.
+FABRICATED_SOURCE_RE = re.compile(
+    r"(?:19|20)\d{2}\s*년?|pp?\.|쪽\s*\d|출판부|출판사|박사학위|석사학위|학위논문|"
+    r"서울\s*:|법인문화사|탐구당|동국대학교|서울대학교|연세대학교|고려대학교|"
+    r"대학교출판|인문사|신서관|을유문화사|솔출판사"
+)
+
+
+def _is_fabricated_source(source: str) -> bool:
+    """제안 문구에 현대 서지 표기가 있으면 지어낸 출처로 간주한다."""
+    return bool(FABRICATED_SOURCE_RE.search(source or ""))
+
+
 MAX_ITEM_CHARS = 500
 MAX_HEADING_CHARS = 200
 
@@ -805,7 +848,14 @@ async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnot
             annotations.extend(result.annotations)
         except Exception as error:
             _log_llm_failure("주석 출처 판독", error)
-    return _cap_annotations(annotations)
+    # '원고에 없는 자료 금지'를 프롬프트만 믿지 말고 코드로 검사한다.
+    kept = [a for a in annotations if not _is_fabricated_source(a.source)]
+    dropped = len(annotations) - len(kept)
+    if dropped:
+        logging.getLogger(__name__).info(
+            "지어낸 외부 서지 제안 %d건 차단", dropped
+        )
+    return _cap_annotations(kept)
 
 
 @workflows.activity(name="pdf-build-result", start_to_close_timeout=CONVERT_TIMEOUT)
