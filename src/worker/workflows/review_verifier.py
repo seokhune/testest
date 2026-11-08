@@ -19,8 +19,23 @@ from __future__ import annotations
 import re
 
 
+import re as _re
+
+# 한자·비표준 인코딩 영역: PDF 엔진(pypdf/pdf2docx)마다 추출이 달라지는 글자들
+_HANJA_RE = _re.compile(r"[\u3000-\u9fff\u3400-\u4dbf\uf000-\ufaff\ufe30-\ufe4f]")
+
+
 def _norm(text: str) -> str:
     return "".join((text or "").split())
+
+
+def _korean_only(text: str) -> str:
+    """한자·비표준 인코딩 글자를 제외한 텍스트(공백 제거).
+
+    pypdf와 pdf2docx가 한자를 다른 코드포인트로 추출하는 경우가 있어,
+    전체 대조가 실패하면 한글만으로 다시 대조한다.
+    """
+    return _norm(_HANJA_RE.sub("", text or ""))
 
 
 def verify_review_docx(
@@ -47,6 +62,7 @@ def verify_review_docx(
         "".join(t.text or "" for t in p.iter(qn("w:t"))) for p in paragraphs
     ]
     whole_text = _norm("\n".join(paragraph_texts))
+    whole_korean = _korean_only("\n".join(paragraph_texts))
 
     # 1. 본문 무결성
     revised_by_block: dict[str, str] = {}
@@ -60,9 +76,19 @@ def verify_review_docx(
         revised = _norm(revised_by_block.get(block.block_id) or "")
         # 교정이 반영되었으면 수정문이, 가드 등으로 건너뛰어졌으면
         # 원문이 있어야 한다. 둘 다 없어야 유실이다.
+        # 전체 대조가 실패하면 한글만으로 다시 대조한다(한자 추출 인코딩 차이 허용).
         present = (original and original in whole_text) or (
             revised and revised in whole_text
         )
+        if not present:
+            korean_original = _korean_only(block.text)
+            korean_revised = _korean_only(
+                revised_by_block.get(block.block_id) or block.text
+            )
+            if len(korean_original) >= 10:
+                present = korean_original in whole_korean
+            if not present and len(korean_revised) >= 10:
+                present = korean_revised in whole_korean
         if not present:
             expected = revised_by_block.get(block.block_id) or block.text
             missing_body.append(
@@ -75,7 +101,14 @@ def verify_review_docx(
     footnote_blocks = [b for b in blocks if _is_hanja_footnote(b.text)]
     missing_footnotes: list[str] = []
     for block in footnote_blocks:
-        if _norm(block.text) and _norm(block.text) not in whole_text:
+        if not _norm(block.text):
+            continue
+        present = _norm(block.text) in whole_text
+        if not present:
+            korean = _korean_only(block.text)
+            if len(korean) >= 10:
+                present = korean in whole_korean
+        if not present:
             number_match = re.match(r"^\s*(\d{1,3})\s*\)", block.text.strip())
             label = f"각주 {number_match.group(1)}번" if number_match else block.block_id
             missing_footnotes.append(f"각주 유실: {label} (p{block.page})")

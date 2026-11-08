@@ -532,11 +532,8 @@ def match_translation_to_block(
     LLM이 item_id를 다양한 형식('p27', '27', '주석 27번')으로 적어도
     각주 번호 기반으로 찾아낸다. 못 찾으면 텍스트 일치로 찾는다.
     """
-    by_id = {block.block_id: block for block in blocks}
-    block = by_id.get(translation.item_id)
-    if block is not None:
-        return block
-    # item_id에서 숫자 추출 ('주석 27번' → '27')
+    # 각주 번호가 가장 신뢰할 수 있는 단서다(문맥상 각주 번호는 유일하다).
+    # LLM이 item_id를 잘못 적어도 각주 번호로 정확히 찾는다.
     id_number = re.search(r"(\d{1,3})", translation.item_id or "")
     original_number = _footnote_number(translation.original or "")
     for number in (original_number, id_number.group(1) if id_number else None):
@@ -545,6 +542,10 @@ def match_translation_to_block(
         for candidate in blocks:
             if _footnote_number(candidate.text) == number:
                 return candidate
+    by_id = {block.block_id: block for block in blocks}
+    block = by_id.get(translation.item_id)
+    if block is not None:
+        return block
     # 텍스트 일치(접두사)로 찾는다
     needle = _norm_text(translation.original or "")[:60]
     if needle:
@@ -888,14 +889,30 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
             if missing:
                 retry = await _attempt(missing)
                 translations.extend(retry)
-                still_missing = [
-                    b.block_id
-                    for b in missing
-                    if b.block_id not in {t.item_id for t in retry}
+                retry_ids = {
+                    match_translation_to_block(t, missing).block_id
+                    for t in retry
+                    if match_translation_to_block(t, missing) is not None
+                }
+                still_missing = [b for b in missing if b.block_id not in retry_ids]
+                # 2차 재시도: 남은 항목을 한 건씩 개별 요청한다.
+                for block in still_missing:
+                    try:
+                        solo = await _attempt([block])
+                        translations.extend(solo)
+                    except Exception as error:
+                        _log_llm_failure("한문 번역(개별 재시도)", error)
+                final_ids = set()
+                for t in translations:
+                    matched = match_translation_to_block(t, chunk)
+                    if matched is not None:
+                        final_ids.add(matched.block_id)
+                unresolved = [
+                    b.block_id for b in chunk if b.block_id not in final_ids
                 ]
-                if still_missing:
+                if unresolved:
                     logging.getLogger(__name__).warning(
-                        "한문 번역 재시도 후에도 누락: %s", still_missing
+                        "한문 번역 재시도 후에도 누락: %s", unresolved
                     )
         except Exception as error:
             _log_llm_failure("한문 번역", error)
