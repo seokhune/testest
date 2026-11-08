@@ -29,8 +29,8 @@ drive = connector(name="google_drive_mcp")
 
 PATCH_TIMEOUT = timedelta(minutes=5)
 
-SECTION3_PLACEHOLDER_MARK = "별도 수행"
 SECTION3_HEADING = "3) 본문-주석 내용 차이"
+SECTION4_HEADING = "4) 주석 출처 보완 제안"
 
 
 class DocxPatchInput(pydantic.BaseModel):
@@ -76,28 +76,37 @@ async def patch_section3(
     def _patch() -> tuple[bytes, int, int]:
         document = Document(io.BytesIO(docx_bytes))
         paragraphs = list(document.element.body.iter(qn("w:p")))
-        replaced = 0
-        inserted = 0
-        for paragraph in paragraphs:
+        heading_index = None
+        next_index = None
+        for index, paragraph in enumerate(paragraphs):
             text = "".join(t.text or "" for t in paragraph.iter(qn("w:t")))
-            if SECTION3_PLACEHOLDER_MARK not in text:
+            stripped = text.strip()
+            if heading_index is None and stripped.startswith(SECTION3_HEADING):
+                heading_index = index
                 continue
-            anchor = paragraph
-            for line in lines:
-                new_paragraph = document.add_paragraph(line)
-                anchor.addnext(new_paragraph._p)
-                anchor = new_paragraph._p
-                inserted += 1
-            paragraph.getparent().remove(paragraph)
-            replaced += 1
-            break
-        if replaced == 0:
+            if heading_index is not None and stripped.startswith(SECTION4_HEADING):
+                next_index = index
+                break
+        if heading_index is None or next_index is None:
             raise workflows.WorkflowError(
-                "3번 섹션 안내 문구를 찾지 못했습니다"
+                "3번/4번 섹션 경계를 찾지 못했습니다"
             )
+        # 3번 헤딩과 4번 헤딩 사이의 모든 문단(구 방식의 차이 항목 포함)을 지운다
+        removed = 0
+        for paragraph in paragraphs[heading_index + 1 : next_index]:
+            paragraph.getparent().remove(paragraph)
+            removed += 1
+        # 3번 헤딩 바로 뒤에 새 내용을 삽입한다
+        anchor = paragraphs[heading_index]
+        inserted = 0
+        for line in lines:
+            new_paragraph = document.add_paragraph(line)
+            anchor.addnext(new_paragraph._p)
+            anchor = new_paragraph._p
+            inserted += 1
         buffer = io.BytesIO()
         document.save(buffer)
-        return buffer.getvalue(), replaced, inserted
+        return buffer.getvalue(), removed, inserted
 
     new_bytes, replaced, inserted = await asyncio.to_thread(_patch)
 
