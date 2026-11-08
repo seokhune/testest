@@ -399,10 +399,10 @@ async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None
         total_pages: int,
         year_sections: list,
         stats: dict,
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         assert year_sections, "년도 구간이 계산되어야 한다"
         docx_bytes = _docx_bytes_from_paragraphs(["결과 문단입니다."])
-        return base64.b64encode(docx_bytes).decode()
+        return base64.b64encode(docx_bytes).decode(), []
 
     @sdk_workflows.activity(name="pdf-annotate-source-titles")
     async def fake_annotate_source_titles(blocks: list) -> list:
