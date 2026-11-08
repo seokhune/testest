@@ -539,8 +539,13 @@ def match_translation_to_block(
     for number in (original_number, id_number.group(1) if id_number else None):
         if not number:
             continue
+        try:
+            wanted = int(number)
+        except ValueError:
+            continue
         for candidate in blocks:
-            if _footnote_number(candidate.text) == number:
+            candidate_number = _footnote_number(candidate.text)
+            if candidate_number and int(candidate_number) == wanted:
                 return candidate
     by_id = {block.block_id: block for block in blocks}
     block = by_id.get(translation.item_id)
@@ -916,7 +921,15 @@ async def translate_hanja_blocks(blocks: list[BodyBlock]) -> list[HanjaTranslati
                     )
         except Exception as error:
             _log_llm_failure("한문 번역", error)
-    return _cap_translations(translations)
+    # 재시도로 생긴 중복을 블록별로 하나만 남긴다(상한 잘림 방지).
+    deduped: dict[str, HanjaTranslation] = {}
+    for translation in translations:
+        block = match_translation_to_block(translation, targets)
+        if block is not None and block.block_id not in deduped:
+            deduped[block.block_id] = translation.model_copy(
+                update={"item_id": block.block_id}
+            )
+    return _cap_translations(list(deduped.values()))
 
 
 @workflows.activity(name="pdf-annotate-source-titles", start_to_close_timeout=LLM_TIMEOUT)
