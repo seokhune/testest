@@ -32,13 +32,20 @@ def _norm(text: str) -> str:
     return unicodedata.normalize("NFC", "".join((text or "").split()))
 
 
-def _korean_only(text: str) -> str:
-    """한자·비표준 인코딩 글자를 제외한 텍스트(공백 제거).
+# 한글과 숫자 외의 모든 것(한자·문장부호·괄호 등)을 제거한다.
+# pypdf는 '청태(淸泰) 3년'처럼 괄호를 추출하고 pdf2docx는 '청태3년'처럼
+# 떼어내는 등, 두 엔진의 문장부호 추출이 달라 최종 대조는 한글·숫자만으로 한다.
+_LETTER_RE = _re.compile(r"[^\uac00-\ud7af0-9]")
 
-    pypdf와 pdf2docx가 한자를 다른 코드포인트로 추출하는 경우가 있어,
-    전체 대조가 실패하면 한글만으로 다시 대조한다.
+
+def _korean_only(text: str) -> str:
+    """한글과 숫자만 남긴 텍스트(공백·한자·문장부호 제거).
+
+    pypdf와 pdf2docx가 한자·괄호를 다르게 추출하는 경우가 있어,
+    전체 대조가 실패하면 한글·숫자만으로 다시 대조한다.
+    실제 본문 유실(한글 문장 절단)은 이 대조로도 잡힌다.
     """
-    return _norm(_HANJA_RE.sub("", text or ""))
+    return _LETTER_RE.sub("", unicodedata.normalize("NFC", text or ""))
 
 
 def verify_review_docx(

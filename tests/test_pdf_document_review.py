@@ -874,3 +874,27 @@ def test_block_id_number_does_not_hijack_translation() -> None:
         translation="병신 19년 봄 2월에 박영규가 항복을 청하였다.",
     )
     assert match_translation_to_block(numbered, blocks).block_id == "p3"
+
+
+def test_verifier_tolerates_parenthesis_extraction_differences() -> None:
+    """pypdf '청태(淸泰) 3년' vs pdf2docx '청태3년' — 오탐이면 안 된다."""
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock
+    from worker.workflows.review_verifier import verify_review_docx
+
+    document = Document()
+    # pdf2docx 스타일: 괄호 없이 추출됨
+    document.add_paragraph("31) <역자 주> 책부원귀에서 형순이 사신으로 온 기록은 권976이 아니라 권972에 나온다. 또 두 차례 입공하였는데, 먼저 후당 폐제 청태3년에 왔다가 3년 후인 후진 고조 천복4년에 다시 온 것으로 되어 있다.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    # pypdf 스타일: 한자가 괄호 안에 들어있음
+    block = BodyBlock(
+        block_id="p62",
+        text="31) <역자 주> 책부원귀에서 형순이 사신으로 온 기록은 권976이 아니라 권972에 나온다. 또 두 차례 입공하였는데, 먼저 후당 폐제 청태(淸泰) 3년에 왔다가 3년 후인 후진 고조 천복(天福) 4년에 다시 온 것으로 되어 있다.",
+        page=14,
+    )
+    errors = verify_review_docx(buffer.getvalue(), [block], [], [], [])
+    assert errors == []
