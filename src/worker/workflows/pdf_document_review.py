@@ -999,6 +999,11 @@ async def build_result_docx(
     # 실행이 실패하고 원인 목록이 에러 메시지에 담긴다.
     from worker.workflows.review_verifier import verify_review_docx
 
+    flat_annotations = [
+        _normalize_section_item(item, SourceAnnotation)
+        for section in year_sections
+        for item in section["annotations"]
+    ]
     verification_errors = await asyncio.to_thread(
         verify_review_docx,
         final,
@@ -1006,7 +1011,7 @@ async def build_result_docx(
         flat_edits,
         flat_translations,
         year_sections,
-        source_annotations,
+        flat_annotations,
     )
     if verification_errors:
         raise workflows.WorkflowError(
