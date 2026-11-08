@@ -936,8 +936,9 @@ async def build_result_docx(
     year_sections: list,
     stats: dict[str, int],
     client: ToolCallClient = Depends(drive),
-) -> str:
-    """검수 결과 한 파일(원본 양식 본문 + 년도별 리포트)을 만들어 base64로 반환한다.
+) -> tuple[str, list[str]]:
+    """검수 결과 한 파일(원본 양식 본문 + 년도별 리포트)을 만들어
+    (base64, 품질 검증 오류 목록)을 반환한다. 오류 목록이 비어 있어야 업로드한다.
 
     다운로드→변환→교정을 한 액티비티 안에서 처리하고 작은 DOCX만
     반환한다(액티비티 결과가 base64 2MB 이벤트 한도를 넘지 않게).
@@ -1013,13 +1014,9 @@ async def build_result_docx(
         year_sections,
         flat_annotations,
     )
-    if verification_errors:
-        raise workflows.WorkflowError(
-            "출력 품질 검증 실패 (업로드 중단): "
-            + "; ".join(verification_errors[:10]),
-            non_retryable=True,
-        )
-    return base64.b64encode(final).decode()
+    # 검증 실패 사유는 워크플로우 레벨에서 보고한다(플랫폼이 활동 내부
+    # 예외 메시지를 삼키기 때문).
+    return base64.b64encode(final).decode(), verification_errors
 
 
 @workflows.activity(
@@ -1117,7 +1114,8 @@ class PdfDocumentReviewWorkflow:
             "page_end": data.page_end or 0,
         }
 
-        result_b64 = await _guarded("결과 문서 생성", build_result_docx(
+        result_b64, verification_errors = await _guarded(
+            "결과 문서 생성", build_result_docx(
             source,
             pages[0][0] if pages else 1,
             pages[-1][0] if pages else total_pages,
@@ -1126,6 +1124,13 @@ class PdfDocumentReviewWorkflow:
             year_sections,
             stats,
         ))
+
+        if verification_errors:
+            raise workflows.WorkflowError(
+                "출력 품질 검증 실패 (업로드 중단): "
+                + " | ".join(verification_errors[:15]),
+                non_retryable=True,
+            )
 
         range_suffix = ""
         if data.page_start is not None or data.page_end is not None:
