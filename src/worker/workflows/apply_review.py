@@ -38,6 +38,32 @@ PAIR_RE = re.compile(
 )
 
 
+def parse_year_sections(report_text: str) -> list[dict]:
+    """리포트를 년도별 섹션으로 파싱한다.
+
+    〔(년도) 검수 리포트〕 헤더를 기준으로 분리한다.
+    헤더가 없으면 빈 리스트를 반환한다.
+    """
+    sections: list[dict] = []
+    pattern = re.compile(r"〔(.+?) 검수 리포트〕")
+    current_year = None
+    current_lines: list[str] = []
+    for line in report_text.splitlines():
+        match = pattern.search(line)
+        if match:
+            if current_year is not None:
+                sections.append(
+                    {"year": current_year, "lines": list(current_lines)}
+                )
+            current_year = match.group(1)
+            current_lines = [line]
+        elif current_year is not None:
+            current_lines.append(line)
+    if current_year is not None:
+        sections.append({"year": current_year, "lines": list(current_lines)})
+    return sections
+
+
 def parse_corrections(report_text: str) -> list[dict]:
     """리포트에서 교정 쌍을 파싱한다. 발췌용 … 생략 부호는 그대로 둔다."""
     pairs: list[dict] = []
@@ -126,26 +152,86 @@ async def apply_review(
 
     new_bytes, applied = await asyncio.to_thread(_apply)
 
-    async def _upload_tail(docx_bytes: bytes) -> bytes:
-        # 리포트 전문을 문서 뒤에 년도 리포트로 삽입한다.
-        def _append() -> bytes:
-            from docx import Document
-            from docx.oxml.ns import qn
+    def _insert_reports() -> bytes:
+        # 년도별 섹션을 파싱해서 해당 년도 헤딩 직전에 삽입한다.
+        from docx import Document
+        from docx.oxml.ns import qn
 
-            document = Document(io.BytesIO(docx_bytes))
-            body = document.element.body
-            anchor = body.find(qn("w:sectPr"))
-            for line in report_text.splitlines():
-                paragraph = document.add_paragraph(line)
-                if anchor is not None:
-                    anchor.addprevious(paragraph._p)
-                else:
-                    body.append(paragraph._p)
-            buffer = io.BytesIO()
-            document.save(buffer)
-            return buffer.getvalue()
+        year_sections = parse_year_sections(report_text)
+        document = Document(io.BytesIO(new_bytes))
+        paragraphs = list(document.element.body.iter(qn("w:p")))
+        paragraph_texts = [
+            "".join(t.text or "" for t in p.iter(qn("w:t")))
+            for p in paragraphs
+        ]
 
-        return await asyncio.to_thread(_append)
+        placed_count = 0
+        placed_indices: set[int] = set()
+        for section in year_sections:
+            year_norm = re.sub(r"\s+", "", section["year"])
+            # 이 년도의 헤딩(예: '태조 19년')이 문서에 있는지 찾는다
+            # 헤딩은 본문 중간에 있고, 그 직전이 삽입 위치다.
+            # 다음 년도 헤딩을 찾아 그 직전에 삽입한다.
+            pass
+
+        # 각 년도 섹션을 다음 년도 헤딩 직전에 삽입한다.
+        # 마지막 년도는 문서 끝에 삽입한다.
+        for section in year_sections:
+            year_core = section["year"].split("(")[0].strip()
+            year_norm = re.sub(r"\s+", "", year_core)
+            # 이 년도 다음에 오는 년도 헤딩을 찾는다 (년도 목록에서)
+            next_year = None
+            for other in year_sections:
+                if other is section:
+                    continue
+                other_core = other["year"].split("(")[0].strip()
+                if other_core > year_core:
+                    if next_year is None or other_core < next_year:
+                        next_year = other_core
+            if next_year:
+                # 다음 년도 헤딩 위치를 찾는다
+                found = False
+                for index, text in enumerate(paragraph_texts):
+                    if index in placed_indices:
+                        continue
+                    text_norm = re.sub(r"\s+", "", text)
+                    if next_year.replace(" ", "") in text_norm:
+                        anchor = paragraphs[index]
+                        for line in section["lines"]:
+                            para = document.add_paragraph(line)
+                            anchor.addprevious(para._p)
+                        placed_indices.add(index)
+                        placed_count += 1
+                        found = True
+                        break
+                if not found:
+                    # 못 찾으면 문서 끝에
+                    body = document.element.body
+                    anchor_el = body.find(qn("w:sectPr"))
+                    for line in section["lines"]:
+                        para = document.add_paragraph(line)
+                        if anchor_el is not None:
+                            anchor_el.addprevious(para._p)
+                        else:
+                            body.append(para._p)
+                    placed_count += 1
+            else:
+                # 마지막 년도는 문서 끝에
+                body = document.element.body
+                anchor_el = body.find(qn("w:sectPr"))
+                for line in section["lines"]:
+                    para = document.add_paragraph(line)
+                    if anchor_el is not None:
+                        anchor_el.addprevious(para._p)
+                    else:
+                        body.append(para._p)
+                placed_count += 1
+
+        buffer = io.BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    final_bytes = await asyncio.to_thread(_insert_reports)
 
     final_bytes = await _upload_tail(new_bytes)
 
