@@ -92,20 +92,37 @@ async def apply_review(
     def _apply() -> tuple[bytes, int]:
         from docx import Document
         from docx.oxml.ns import qn
+        from worker.workflows.hwp_review_docx import _apply_text_edit
 
-        edits = [
-            TextEdit(
-                item_id=f"r{index}",
-                original=pair["original"],
-                revised=pair["revised"],
-                category="report",
-                reason="리포트 교정 반영",
-            )
-            for index, pair in enumerate(pairs)
-        ]
-        # 원문 발췌(… 포함) 기준으로 문단을 찾아 교정한다.
-        new_bytes, applied = apply_edits_by_text(frame_bytes, edits, [], None)
-        return new_bytes, applied
+        document = Document(io.BytesIO(frame_bytes))
+        paragraphs = list(document.element.body.iter(qn("w:p")))
+        applied = 0
+        used: set[int] = set()
+        for pair in pairs:
+            # 발췌의 … 를 떼고 핵심 구간만 남긴다.
+            orig_core = pair["original"].strip().strip("…").strip()
+            rev_core = pair["revised"].strip()
+            rev_core = re.sub(r"^…\s*", "", rev_core)
+            rev_core = re.sub(r"\s*…$", "", rev_core).strip()
+            if not orig_core or orig_core == rev_core:
+                continue
+            for index, paragraph in enumerate(paragraphs):
+                if index in used:
+                    continue
+                text = "".join(t.text or "" for t in paragraph.iter(qn("w:t")))
+                if orig_core not in text:
+                    continue
+                # 문단 안에서 발췌 구간만 교체한다.
+                new_text = text.replace(orig_core, rev_core, 1)
+                if new_text == text:
+                    continue
+                _apply_text_edit(paragraph, new_text)
+                used.add(index)
+                applied += 1
+                break
+        buffer = io.BytesIO()
+        document.save(buffer)
+        return buffer.getvalue(), applied
 
     new_bytes, applied = await asyncio.to_thread(_apply)
 
