@@ -62,7 +62,7 @@ def parse_corrections(report_text: str) -> list[dict]:
 @workflows.activity(name="apply-review", start_to_close_timeout=APPLY_TIMEOUT)
 async def apply_review(
     frame_file_id: str,
-    report_file_id: str,
+    report_file_ids: list[str],
     title: str,
     parent_id: str | None,
     client: ToolCallClient = Depends(drive),
@@ -82,8 +82,11 @@ async def apply_review(
         return base64.b64decode(content)
 
     frame_bytes = await _download(frame_file_id)
-    report_bytes = await _download(report_file_id)
-    report_text = report_bytes.decode("utf-8", errors="replace")
+    report_parts: list[str] = []
+    for report_file_id in report_file_ids:
+        report_bytes = await _download(report_file_id)
+        report_parts.append(report_bytes.decode("utf-8", errors="replace"))
+    report_text = "\n\n======================================================================\n\n".join(report_parts)
     pairs = parse_corrections(report_text)
 
     def _apply() -> tuple[bytes, int]:
@@ -157,7 +160,7 @@ async def apply_review(
 
 class ApplyReviewInput(pydantic.BaseModel):
     frame_file_id: str  # 원본틀 DOCX 파일 ID
-    report_file_id: str  # 검수 리포트 txt 파일 ID
+    report_file_ids: list[str] = []  # 겹치는 검수 리포트 txt 파일 ID 목록
     output_title: str
     output_parent_id: str | None = None
 
@@ -174,7 +177,7 @@ class ApplyReviewWorkflow:
     async def run(self, data: ApplyReviewInput) -> ApplyReviewOutput:
         parent = data.output_parent_id or "0AOuygiQzrnEVUk9PVA"
         result_file, applied, total = await apply_review(
-            data.frame_file_id, data.report_file_id, data.output_title, parent
+            data.frame_file_id, data.report_file_ids, data.output_title, parent
         )
         return ApplyReviewOutput(
             result_file=result_file,
