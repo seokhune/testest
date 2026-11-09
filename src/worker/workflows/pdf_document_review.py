@@ -154,7 +154,7 @@ YEAR_HEADING_RE = re.compile(
     rf"(?:고려\s*)?"
     rf"(?:{KING_NAMES})"
     rf"(?:\s*\([^)]*\))?"
-    rf"\s*(?:\d{{1,3}}\s*년(?:\s*\([^)]*\))?|원년)"
+    rf"\s*(?:\d{{1,4}}\s*년(?:\s*\([^)]*\))?|원년)"
     rf")"
 )
 
@@ -524,7 +524,7 @@ def reconcile_edits(
 
 def _footnote_number(text: str) -> str | None:
     """'27) 八月…' 형태에서 각주 번호('27')를 뽑는다."""
-    match = re.match(r"^\s*(\d{1,3})\s*\)", (text or "").strip())
+    match = re.match(r"^\s*(\d{1,4})\s*\)", (text or "").strip())
     return match.group(1) if match else None
 
 
@@ -556,7 +556,7 @@ def match_translation_to_block(
     # 3) item_id가 '주석 2번', '2'처럼 각주 번호를 직접 가리킬 때만
     #    번호 매칭을 쓴다('p3' 형태는 2)에서 이미 처리했다).
     if not re.fullmatch(r"p\d+", (translation.item_id or "").strip()):
-        id_number = re.search(r"(\d{1,3})", translation.item_id or "")
+        id_number = re.search(r"(\d{1,4})", translation.item_id or "")
         if id_number:
             try:
                 wanted = int(id_number.group(1))
@@ -571,7 +571,7 @@ def match_translation_to_block(
     needle = _norm_text(translation.original or "")[:60]
     if needle:
         for candidate in blocks:
-            stripped = re.sub(r"^\s*\d{1,3}\s*\)\s*", "", candidate.text)
+            stripped = re.sub(r"^\s*\d{1,4}\s*\)\s*", "", candidate.text)
             if _norm_text(candidate.text).startswith(needle) or _norm_text(
                 stripped
             ).startswith(needle):
@@ -965,7 +965,7 @@ async def annotate_footnote_sources(blocks: list[BodyBlock]) -> list[SourceAnnot
     block_text_by_id = {block.block_id: block.text for block in blocks}
     for annotation in annotations:
         block_text = block_text_by_id.get(annotation.item_id, "")
-        number_match = re.match(r"^\s*(\d{1,3})\s*\)", (block_text or "").strip())
+        number_match = re.match(r"^\s*(\d{1,4})\s*\)", (block_text or "").strip())
         if number_match:
             annotation.footnote_number = number_match.group(1)
     # '원고에 없는 자료 금지'를 프롬프트만 믿지 말고 코드로 검사한다.
