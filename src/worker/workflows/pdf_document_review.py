@@ -87,7 +87,7 @@ def _chunk(items: list, size: int) -> list[list]:
 
 
 SENTENCE_ENDINGS = (".", "?", "!", "。")
-FOOTNOTE_LINE_RE = re.compile(r"^\d{1,3}\)")
+FOOTNOTE_LINE_RE = re.compile(r"^\d{1,4}\)")
 
 
 def _paragraphs_from_lines(lines: list[str]) -> list[str]:
@@ -318,7 +318,7 @@ def _footnote_label(block_id: str, original_text: str) -> str:
 
     각주 번호를 못 찾으면 블록 ID로 대신한다.
     """
-    match = re.match(r"^\s*(\d{1,3})\s*\)", (original_text or "").strip())
+    match = re.match(r"^\s*(\d{1,4})\s*\)", (original_text or "").strip())
     if match:
         return f"주석 {match.group(1)}번"
     return block_id
@@ -688,10 +688,10 @@ QUOTE_DIFFERENCE_PROMPT = """아래는 번역서 문단 목록입니다. 본문(
 """
 
 
-MAX_EDITS = 10_000
-MAX_TRANSLATIONS = 10_000
-MAX_DIFFERENCES = 10_000
-MAX_ANNOTATIONS = 10_000
+MAX_EDITS = 40
+MAX_TRANSLATIONS = 40
+MAX_DIFFERENCES = 20
+MAX_ANNOTATIONS = 40
 # 원고에 존재할 수 없는 현대 서지 표기 - LLM이 지어낸 출처를 코드 레벨에서 차단한다.
 FABRICATED_SOURCE_RE = re.compile(
     r"(?:19|20)\d{2}\s*년?|pp?\.|쪽\s*\d|출판부|출판사|박사학위|석사학위|학위논문|"
@@ -705,7 +705,7 @@ def _is_fabricated_source(source: str) -> bool:
     return bool(FABRICATED_SOURCE_RE.search(source or ""))
 
 
-MAX_ITEM_CHARS = 10_000
+MAX_ITEM_CHARS = 500
 MAX_HEADING_CHARS = 200
 
 
