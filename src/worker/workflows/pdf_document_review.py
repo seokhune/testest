@@ -48,7 +48,7 @@ from worker.workflows.hwp_review_docx import (
     unwrap_text_frames,
 )
 
-REVIEW_MODEL = "mistral-large-latest"
+REVIEW_MODEL = "mistral-large-2512"  # pinned: -latest now resolves to reasoning model Large 4 (ThinkChunk breaks JSON parse)
 LLM_CHUNK_SIZE = 8
 LLM_TIMEOUT = timedelta(seconds=900)
 IO_TIMEOUT = timedelta(seconds=120)
