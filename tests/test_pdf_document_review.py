@@ -1,0 +1,936 @@
+"""PDF 검수 워크플로우 단위 테스트."""
+
+import asyncio
+import base64
+from datetime import timedelta
+
+import mistralai.workflows as sdk_workflows
+import pytest
+from mistralai.workflows.testing import create_test_worker
+
+import worker.workflows.pdf_document_review as review_module
+from worker.workflows.hwp_review_models import (
+    DriveFileInfo,
+    HanjaTranslation,
+    PdfReviewOutput,
+    TextEdit,
+)
+from worker.workflows.pdf_document_review import (
+    PdfDocumentReviewWorkflow,
+    blocks_from_pages,
+    detect_year,
+    group_by_year,
+)
+
+
+def make_pdf_text() -> str:
+    parts = []
+    for page in range(6, 18):
+        parts.append(f"- {page} -")
+        parts.append(f"{page}번째 페이지 첫 문단입니다. 조선의 사적을 따른다.")
+        parts.append("")
+        parts.append(f"{page}번째 페이지 둘째 문단, 태조 원년의 기사이다.")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def test_blocks_from_pages_merges_lines_into_paragraphs() -> None:
+    from worker.workflows.pdf_document_review import blocks_from_pages
+
+    pages = [
+        (
+            8,
+            "태조 19년(임신) 정월에 하왕이\n즉위하였다.\n하왕이 폐세자를 서인으로\n보내였다.\n1) <보기> 인용문이다.",
+        ),
+        (9, "- 9 -\n한 문장입니다."),
+    ]
+    blocks = blocks_from_pages(pages)
+    assert [(b.page, b.text) for b in blocks] == [
+        (8, "태조 19년(임신) 정월에 하왕이 즉위하였다."),
+        (8, "하왕이 폐세자를 서인으로 보내였다."),
+        (8, "1) <보기> 인용문이다."),
+        (9, "한 문장입니다."),
+    ]
+    assert blocks[0].block_id == "p0"
+    assert blocks[3].block_id == "p3"
+
+
+def test_detect_year_reads_reign_year_headings() -> None:
+    assert detect_year("태종 6년(무인) 봄 정월에 ...") == "태종 6년(무인)"
+    # 왕호 없이 시작하는 조각은 헤딩이 아니다 (오탐 방지)
+    assert detect_year("2\n6년(임오) 상왕이 ...") is None
+    assert detect_year("태조 원년 임신에 ...") == "태조 원년"
+    assert detect_year("그해 겨울에 큰 눈이 내렸다.") is None
+
+
+def test_group_by_year_buckets_edits() -> None:
+    from worker.workflows.hwp_review_models import BodyBlock
+
+    blocks = [
+        BodyBlock(block_id="p0", text="태종 6년(무인) 봄 정월에 초하루 병술에", page=8),
+        BodyBlock(block_id="p1", text="김첨을 의정부에 보내았다.", page=8),
+        BodyBlock(block_id="p2", text="태종 7년(기묘) 가을에", page=9),
+        BodyBlock(block_id="p3", text="하륜이 상서하였다.", page=9),
+    ]
+    edits = [
+        TextEdit(item_id="p1", original="a", revised="b", category="typo", reason="r"),
+        TextEdit(item_id="p3", original="c", revised="d", category="spacing", reason="s"),
+    ]
+    translations = [
+        HanjaTranslation(item_id="p0", original="漢文", translation="한문 번역"),
+    ]
+    from worker.workflows.hwp_review_models import BodyFootnoteDifference
+
+    differences = [
+        BodyFootnoteDifference(
+            body_block_id="p3", footnote_id="5", difference="인용 문구가 다르다"
+        )
+    ]
+    sections = group_by_year(blocks, edits, translations, differences)
+    assert [section["year"] for section in sections] == [
+        "태종 6년(무인)",
+        "태종 7년(기묘)",
+    ]
+    assert sections[0]["heading"].startswith("태종 6년(무인)")
+    assert [e.item_id for e in sections[0]["edits"]] == ["p1"]
+    assert [t.item_id for t in sections[0]["translations"]] == ["p0"]
+    assert [e.item_id for e in sections[1]["edits"]] == ["p3"]
+    assert [d.footnote_id for d in sections[1]["differences"]] == ["5"]
+
+
+def test_reconcile_edits_remaps_invented_ids() -> None:
+    from worker.workflows.hwp_review_models import BodyBlock
+    from worker.workflows.pdf_document_review import reconcile_edits
+
+    blocks = [
+        BodyBlock(block_id="p0", text="태종 6년(무인) 봄 정월에", page=8),
+        BodyBlock(block_id="p1", text="김첨을 의정부에 보내았다.", page=8),
+    ]
+    edits = [
+        TextEdit(
+            item_id="p12",
+            original="김첨을 의정부에 보내았다.",
+            revised="김첨을 의정부에 보내었다.",
+            category="typo",
+            reason="어미 교정",
+        ),
+        TextEdit(
+            item_id="p99",
+            original="매칭 안 되는 문장",
+            revised="무시된다",
+            category="typo",
+            reason="r",
+        ),
+    ]
+    result = reconcile_edits(blocks, edits)
+    assert len(result) == 1
+    assert result[0].item_id == "p1"
+    assert result[0].revised == "김첨을 의정부에 보내었다."
+
+
+def _docx_bytes_from_paragraphs(paragraphs: list[str]) -> bytes:
+    import io
+
+    from docx import Document
+
+    document = Document()
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_insert_year_reports_places_full_report_at_year_ends() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyFootnoteDifference
+    from worker.workflows.pdf_document_review import insert_year_reports
+
+    document = Document()
+    document.add_paragraph("태조 19년(임신) 정월에 하왕이 즉위하였다.")
+    document.add_paragraph("하왕이 폐세자를 서인으로 보내였다.")
+    document.add_paragraph("태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다.")
+    document.add_paragraph("태종이 하륜을 문하부에 보내였다.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    sections = [
+        {
+            "year": "태조 19년(임신)",
+            "heading": "태조 19년(임신) 정월에 하왕이 즉위하였다.",
+            "edits": [
+                TextEdit(
+                    item_id="p1",
+                    original="하왕이 폐세자를 서인으로 보내였다.",
+                    revised="하왕이 폐세자를 서인으로 보내었다.",
+                    category="typo",
+                    reason="어미 교정",
+                )
+            ],
+            "translations": [
+                HanjaTranslation(
+                    item_id="p0", original="漢文 주석", translation="한문 번역문"
+                )
+            ],
+            "differences": [
+                BodyFootnoteDifference(
+                    body_block_id="p1", footnote_id="2", difference="인용 불일치"
+                )
+            ],
+            "annotations": [],
+        },
+        {
+            "year": "태조 20년(계유)",
+            "heading": "태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다.",
+            "edits": [
+                TextEdit(
+                    item_id="p3",
+                    original="태종이 하륜을 문하부에 보내였다.",
+                    revised="태종이 하륜을 문하부에 보내었다.",
+                    category="typo",
+                    reason="어미 교정",
+                )
+            ],
+            "translations": [],
+            "differences": [],
+            "annotations": [],
+        },
+    ]
+    result = insert_year_reports(buffer.getvalue(), sections)
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+
+    assert "〔태조 19년(임신) 검수 리포트〕" in texts
+    assert "〔태조 20년(계유) 검수 리포트〕" in texts
+    # 19년 리포트는 20년 제목 직전에 위치해야 한다
+    index_19 = texts.index("〔태조 19년(임신) 검수 리포트〕")
+    index_20_heading = texts.index(
+        "태조 20년(계유) 봄 정월에 하왕이 죽으니 태종이 즉위하였다."
+    )
+    assert index_19 < index_20_heading
+    # 리포트에 네 항목이 모두 들어 있어야 한다
+    body_19 = texts[index_19:index_20_heading]
+    assert "1) 교정 내역" in body_19
+    assert "2) 한문 번역 - 주석번역" in body_19
+    assert "3) 본문-주석 내용 차이" in body_19
+    assert "4) 주석 출처 보완 제안" in body_19
+    # 교정 내역은 문단 전체가 아니라 변경 구간 발췌만 표시한다.
+    assert any("—수정:" in text for text in body_19)
+    # 발췌는 전체 문단보다 짧아야 한다
+    assert any(
+        len(text) < len("—수정: 하왕이 폐세자를 서인으로 보내었다.") for text in body_19 if text.startswith("—수정:")
+    )
+    assert any("번역: 한문 번역문" in text for text in body_19)
+    assert any("인용 불일치" in text for text in body_19)
+    # 마지막 연도(20년) 리포트는 본문 끝에
+    assert texts.index("〔태조 20년(계유) 검수 리포트〕") > texts.index(
+        "태종이 하륜을 문하부에 보내였다."
+    )
+
+
+def test_apply_edits_by_text_preserves_formatting() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_docx import apply_edits_by_text
+
+    document = Document()
+    paragraph = document.add_paragraph()
+    bold = paragraph.add_run("태조원년에 ")
+    bold.bold = True
+    paragraph.add_run("개국하였다. 子曰學而時習之。")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    edits = [
+        TextEdit(
+            item_id="p0",
+            original="태조원년에 개국하였다. 子曰學而時習之。",
+            revised="태조 원년에 개국하였다. 子曰學而時習之。",
+            category="spacing",
+            reason="띄어쓰기",
+        )
+    ]
+    translations = [
+        HanjaTranslation(
+            item_id="p0",
+            original="태조원년에 개국하였다. 子曰學而時習之。",
+            translation="공자가 말하기를, 배우고 때로 익히면 즐겁다.",
+        )
+    ]
+    result, applied = apply_edits_by_text(buffer.getvalue(), edits, translations)
+    assert applied == 1
+
+    document = Document(io.BytesIO(result))
+    paragraph = document.paragraphs[0]
+    assert paragraph.text == "태조 원년에 개국하였다. 子曰學而時習之。"
+    bold_runs = [run for run in paragraph.runs if run.bold]
+    assert bold_runs, "굵은 서식이 보존되어야 한다"
+    assert "번역:" not in paragraph.text, "본문에 번역이 끼워지지 않아야 한다"
+
+
+def test_build_structured_docx_preserves_pages_and_applies_edits() -> None:
+    from worker.workflows.hwp_review_models import BodyBlock
+    from worker.workflows.hwp_review_docx import build_structured_docx
+
+    pages = [
+        (8, "첫 문단입니다.\n\n고려 태조 원년의 기사이다."),
+        (9, "둘째 페이지 문단입니다."),
+    ]
+    blocks = [
+        BodyBlock(block_id="p0", text="첫 문단입니다.", page=8),
+        BodyBlock(block_id="p1", text="고려 태조 원년의 기사이다.", page=8),
+        BodyBlock(block_id="p2", text="둘째 페이지 문단입니다.", page=9),
+    ]
+    edits = [
+        TextEdit(
+            item_id="p1",
+            original="원문과 달라도 상관없다",
+            revised="고려 태조 원년의 기사다.",
+            category="grammar",
+            reason="문맥상 종결형",
+        )
+    ]
+    result, applied = build_structured_docx(pages, blocks, edits, [])
+    assert applied == 1
+
+    import io
+
+    from docx import Document
+
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+    assert "- 8 -" in texts and "- 9 -" in texts
+    assert "고려 태조 원년의 기사다." in texts
+
+
+def test_unwrap_text_frames_keeps_footnote_text() -> None:
+    import io
+
+    from docx import Document
+    from docx.oxml.ns import qn
+    from worker.workflows.hwp_review_docx import unwrap_text_frames
+
+    document = Document()
+    document.add_paragraph("본문 문단입니다.")
+    footnote = document.add_paragraph("1) 주석 인용문입니다.")
+    footnote_paragraph = footnote._p
+    frame_pr = footnote_paragraph.get_or_add_pPr().makeelement(
+        qn("w:framePr"), {}
+    )
+    footnote_paragraph.get_or_add_pPr().append(frame_pr)
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    result = unwrap_text_frames(buffer.getvalue())
+    document = Document(io.BytesIO(result))
+    texts = [p.text for p in document.paragraphs]
+    assert "본문 문단입니다." in texts
+    assert "1) 주석 인용문입니다." in texts
+    assert all(
+        p._p.find(qn("w:pPr")) is None
+        or p._p.find(qn("w:pPr")).find(qn("w:framePr")) is None
+        for p in document.paragraphs
+    )
+
+
+def test_apply_edits_skips_large_deletions() -> None:
+    from worker.workflows.hwp_review_docx import apply_edits_by_text
+
+    docx_bytes = _docx_bytes_from_paragraphs(
+        ["본문 문단입니다. 1) 주석 인용문이 여기에 길게 이어집니다. 2) 또 다른 주석입니다."]
+    )
+    edits = [
+        TextEdit(
+            item_id="p0",
+            original="본문 문단입니다. 1) 주석 인용문이 여기에 길게 이어집니다. 2) 또 다른 주석입니다.",
+            revised="본문 문단입니다.",  # 주석을 통째로 지우는 교정
+            category="style",
+            reason="삭제 시도",
+        )
+    ]
+    result, applied = apply_edits_by_text(docx_bytes, edits, [])
+    assert applied == 0
+
+    import io
+
+    from docx import Document
+
+    document = Document(io.BytesIO(result))
+    assert "주석 인용문" in document.paragraphs[0].text
+
+
+async def test_pdf_document_review_end_to_end(temporal_env, monkeypatch) -> None:
+    pdf_text = make_pdf_text()
+    uploaded: list[str] = []
+
+    @sdk_workflows.activity(name="pdf-find-drive-file")
+    async def fake_find_pdf_file(file_name: str) -> DriveFileInfo:
+        return DriveFileInfo(file_id="pdf-id", title="조선사.pdf", parent_id="folder-1")
+
+    @sdk_workflows.activity(name="pdf-load-pages")
+    async def fake_load_pages(
+        file_id: str, page_start: int | None, page_end: int | None
+    ) -> tuple[list[tuple[int, str]], int]:
+        pages = [
+            (number, f"{number}번째 페이지 첫 문단입니다. 조선의 사적을 따른다.\n\n{number}번째 페이지 둘째 문단, 태조 원년의 기사이다.")
+            for number in range(8, 16)
+        ]
+        return pages, 143
+
+    @sdk_workflows.activity(name="pdf-upload-drive-file")
+    async def fake_upload_drive_file(
+        title: str, content: str, parent_id: str | None
+    ) -> DriveFileInfo:
+        uploaded.append(title)
+        assert base64.b64decode(content)[:2] == b"PK"
+        return DriveFileInfo(
+            file_id=f"upload-{len(uploaded)}", title=title, parent_id=parent_id
+        )
+
+    @sdk_workflows.activity(name="pdf-build-result")
+    async def fake_build_result(
+        source: DriveFileInfo,
+        first_page: int,
+        last_page: int,
+        blocks: list,
+        total_pages: int,
+        year_sections: list,
+        stats: dict,
+    ) -> tuple[str, list[str]]:
+        assert year_sections, "년도 구간이 계산되어야 한다"
+        docx_bytes = _docx_bytes_from_paragraphs(["결과 문단입니다."])
+        return base64.b64encode(docx_bytes).decode(), []
+
+    @sdk_workflows.activity(name="pdf-annotate-source-titles")
+    async def fake_annotate_source_titles(blocks: list) -> list:
+        return []
+
+    @sdk_workflows.activity(name="pdf-compare-quotes")
+    async def fake_compare_quotes(blocks: list) -> list:
+        return []
+
+    @sdk_workflows.activity(name="pdf-annotate-footnote-sources")
+    async def fake_annotate_footnote_sources(blocks: list) -> list:
+        return []
+
+    async def fake_parse(model_class, request):
+        prompt = request.messages[-1].content
+        if model_class is review_module._DifferenceBatch:
+            return review_module._DifferenceBatch(differences=[])
+        if model_class is review_module._EditBatch:
+            if fake_parse.edit_calls:
+                return review_module._EditBatch(edits=[])
+            fake_parse.edit_calls.append(1)
+            return review_module._EditBatch(
+                edits=[
+                    TextEdit(
+                        item_id="p1",
+                        original="6번째 페이지 첫 문단입니다. 조선의 사적을 따른다.",
+                        revised="8번째 페이지 첫 문단입니다. 조선의 사적을 따른다.",
+                        category="typo",
+                        reason="페이지 번호 오기 수정",
+                    )
+                ]
+            )
+        assert model_class is review_module._HanjaBatch
+        return review_module._HanjaBatch(translations=[])
+
+    fake_parse.edit_calls = []
+
+    monkeypatch.setattr(review_module, "find_pdf_file", fake_find_pdf_file)
+    monkeypatch.setattr(review_module, "load_pages", fake_load_pages)
+    monkeypatch.setattr(review_module, "annotate_source_titles", fake_annotate_source_titles)
+    monkeypatch.setattr(review_module, "compare_quotes", fake_compare_quotes)
+    monkeypatch.setattr(review_module, "annotate_footnote_sources", fake_annotate_footnote_sources)
+    monkeypatch.setattr(review_module, "upload_drive_file", fake_upload_drive_file)
+    monkeypatch.setattr(review_module, "chat_parse_to_model", fake_parse)
+    monkeypatch.setattr(review_module, "build_result_docx", fake_build_result)
+
+    async with create_test_worker(
+        temporal_env,
+        workflows=[PdfDocumentReviewWorkflow],
+        activities=[
+            fake_find_pdf_file,
+            fake_load_pages,
+            fake_upload_drive_file,
+            fake_build_result,
+            fake_annotate_source_titles,
+            fake_compare_quotes,
+            fake_annotate_footnote_sources,
+            review_module.proofread_body,
+            review_module.translate_hanja_blocks,
+        ],
+    ) as _worker:
+        handle = await temporal_env.client.start_workflow(
+            "pdf-document-review",
+            {"file_name": "조선사", "page_start": 8, "page_end": 15},
+            id="test-pdf-document-review",
+            task_queue="test-task-queue",
+            execution_timeout=timedelta(seconds=30),
+        )
+        result = await asyncio.wait_for(handle.result(), timeout=45)
+
+    output = PdfReviewOutput.model_validate(result)
+    assert output.source_title == "조선사.pdf"
+    assert output.stats["page_start"] == 8 and output.stats["page_end"] == 15
+    assert output.stats["total_pages"] == 143
+    assert output.stats["body_paragraphs"] == 16
+    assert output.stats["body_edits"] == 1
+    assert "8~15페이지" in output.summary
+    assert "내용 차이" in output.summary
+    assert uploaded == ["조선사_p8-15_검수결과.docx"]
+
+
+def test_excerpt_edit_pair_shows_only_changed_span() -> None:
+    from worker.workflows.pdf_document_review import _excerpt_edit_pair
+
+    original = (
+        "왕이 삼군을 거느리고 개경으로 향하였다. 적병이 크게 궤멸되었다. "
+        "장군 흔달·견달 등 3천 2백인을 사로잡고, 5천 7백 급을 참수하였다."
+    )
+    revised = original.replace("3천 2백인", "3천 2백 명")
+    original_excerpt, revised_excerpt = _excerpt_edit_pair(original, revised)
+
+    # 전체 문단이 아니라 변경 구간 근처만 나와야 한다.
+    assert len(original_excerpt) <= 160
+    assert "3천 2백인" in original_excerpt
+    assert "3천 2백 명" in revised_excerpt
+    assert "왕이 삼군을 거느리고 개경으로 향하였다" not in original_excerpt
+
+
+def test_excerpt_edit_pair_handles_identical_text() -> None:
+    from worker.workflows.pdf_document_review import _excerpt_edit_pair
+
+    original_excerpt, revised_excerpt = _excerpt_edit_pair("동일 문단", "동일 문단")
+    assert original_excerpt == revised_excerpt == "동일 문단"
+
+
+def test_year_report_edits_use_excerpts_not_full_paragraphs() -> None:
+    from worker.workflows.pdf_document_review import _year_reports
+
+    long_text = (
+        "앞부분 문맥이 매우 길게 이어지는 문단이다. " * 5
+        + "중간의 오타를 고친다. "
+        + "뒷부분 문맥도 매우 길게 이어진다. " * 5
+    )
+    section = {
+        "year": "태조 19년(임신)",
+        "edits": [
+            TextEdit(
+                item_id="p1",
+                original=long_text.replace("오타를", "오타아를"),
+                revised=long_text,
+                category="typo",
+                reason="오타",
+            )
+        ],
+        "translations": [],
+        "differences": [],
+        "annotations": [],
+    }
+    lines = _year_reports(section)
+    joined = "\n".join(lines)
+    assert "—원문: " in joined and "—수정: " in joined
+    # 문단 전체가 그대로 들어가면 안 된다.
+    assert long_text not in joined
+    assert "오타아를" in joined
+    assert "오타를 고친다" in joined
+
+
+def test_detect_year_ignores_footnote_and_inline_years() -> None:
+    from worker.workflows.pdf_document_review import detect_year
+
+    # 진짜 헤딩
+    assert detect_year("태조 19년(임신) 정월에 하왕이 즉위하였다.") == "태조 19년(임신)"
+    assert detect_year("태조 20년(계유) 봄 정월") == "태조 20년(계유)"
+    # 각주 내부 연도 (오탐이면 안 됨)
+    assert detect_year("(구오대사) 청태(淸泰)2년에 ...") is None
+    assert detect_year("31) ... 청태 3년 ...") is None
+    assert detect_year("27) 八月五日乙酉 ...") is None
+    # 문단 중간의 연도
+    assert detect_year("이해는 일본 스자쿠(朱雀) 2년이다.") is None
+    assert detect_year("왕이 즉위한 지 2년이 되었다.") is None
+
+
+def test_footnote_label_uses_footnote_number() -> None:
+    from worker.workflows.pdf_document_review import _footnote_label
+
+    assert _footnote_label("p54", "27) 八月五日乙酉 ...") == "주석 27번"
+    assert _footnote_label("p58", "  13) 漢文 원문") == "주석 13번"
+    assert _footnote_label("p99", "각주 번호 없는 발췌") == "p99"
+
+
+def test_fabricated_source_filter() -> None:
+    from worker.workflows.pdf_document_review import _is_fabricated_source
+
+    assert _is_fabricated_source(
+        "김종서 외, 『고려사』, 서울: 동국대학교출판부, 2003, 45쪽.(추정)"
+    )
+    assert _is_fabricated_source("(박사학위논문, 서울대학교대학원, 2014, pp. 120-121)")
+    assert _is_fabricated_source("이긍익, 『연려실기술』 권1, 탐구당, 1976")
+    assert not _is_fabricated_source("『구오대사』 권21 태조 19년 조에 출전 누락")
+    assert not _is_fabricated_source("주석 7번의 출전 표기에서 서지명이 빠져 있다")
+
+
+def test_hanja_footnototes_excluded_from_proofreading() -> None:
+    from worker.workflows.pdf_document_review import _is_hanja_footnote
+
+    # 한문 원문 각주는 교정 대상에서 제외
+    assert _is_hanja_footnote("27) 八月五日乙酉 太保內史令徐熙卒")
+    assert _is_hanja_footnote("13) 九月, 王率三軍 出征")
+    # 한국어 역자 주는 유지
+    assert not _is_hanja_footnote("5) <역자 주> 이 부분은 원문의 표기를 따랐다.")
+    # 본문은 유지
+    assert not _is_hanja_footnote("왕이 삼군을 거느리고 개경으로 향하였다.")
+
+
+def test_annotation_report_uses_footnote_number() -> None:
+    from worker.workflows.hwp_review_models import SourceAnnotation
+    from worker.workflows.pdf_document_review import _year_reports
+
+    section = {
+        "year": "태조 19년(임신)",
+        "edits": [],
+        "translations": [],
+        "differences": [],
+        "annotations": [
+            SourceAnnotation(item_id="p56", source="『구오대사』 권4 출전 누락", footnote_number="7"),
+            SourceAnnotation(item_id="p99", source="서지명이 빠져 있다"),
+        ],
+    }
+    lines = _year_reports(section)
+    joined = "\n".join(lines)
+    assert "[주석 7번] 출처:" in joined
+    assert "[p99] 출처:" in joined
+
+
+def test_apply_edits_preserves_merged_paragraph_tail() -> None:
+    """pdf2docx가 두 블록을 한 문단으로 합친 경우 꼬리가 증발하지 않는지 검증한다."""
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_docx import apply_edits_by_text
+    from worker.workflows.hwp_review_models import BodyBlock
+
+    document = Document()
+    # pypdf는 【황산】을 기준으로 두 블록으로 쪼갰지만 DOCX 문단은 하나다.
+    block_text = "적병이 크게 궤멸되었다. 장군 흔달(昕達)·견달(見達) 등 3천 2백인을 사로잡고,"
+    tail_text = " 5천 7백 급을 참수하였다. 【황산】 적병이 궤멸되어 패주하였다."
+    merged = block_text + tail_text
+    document.add_paragraph(merged)
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    blocks = [BodyBlock(block_id="p23", text=block_text, page=10)]
+    edits = [
+        TextEdit(
+            item_id="p23",
+            original=block_text,
+            revised=block_text.replace("3천 2백인", "3천 2백 명"),
+            category="typo",
+            reason="띄어쓰기",
+        )
+    ]
+    result, applied = apply_edits_by_text(buffer.getvalue(), edits, [], blocks)
+    document = Document(io.BytesIO(result))
+    text = document.paragraphs[0].text
+    assert applied == 1
+    assert "3천 2백 명" in text
+    # 꼬리 전체가 살아 있어야 한다 (135자 증발 사고 방지)
+    assert "5천 7백 급을 참수하였다. 【황산】 적병이 궤멸되어 패주하였다." in text
+
+
+def test_pdf_text_extract_workflow_registers() -> None:
+    import mistralai.workflows as workflows
+    from worker.workflows.pdf_text_extract import PdfTextExtractWorkflow
+
+    definition = workflows.get_workflow_definition(PdfTextExtractWorkflow)
+    assert definition.name == "pdf-text-extract"
+
+
+def test_docx_patch_section3_replaces_whole_block() -> None:
+    import io
+
+    from docx import Document
+    from docx.oxml.ns import qn
+    from worker.workflows.docx_patch_section3 import (
+        SECTION3_HEADING,
+        SECTION4_HEADING,
+    )
+
+    document = Document()
+    document.add_paragraph("1) 교정 내역")
+    document.add_paragraph("3) 본문-주석 내용 차이")
+    for i in range(15):
+        document.add_paragraph(f"· 구방식 차이 {i + 1}")
+    document.add_paragraph("4) 주석 출처 보완 제안")
+    document.add_paragraph("· [주석 7번] 출처: …")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+
+    lines = ["· 매핑 검수 차이 1", "· 매핑 검수 차이 2"]
+    document = Document(io.BytesIO(buffer.getvalue()))
+    paragraphs = list(document.element.body.iter(qn("w:p")))
+    heading_index = next_index = None
+    for index, paragraph in enumerate(paragraphs):
+        text = "".join(t.text or "" for t in paragraph.iter(qn("w:t"))).strip()
+        if heading_index is None and text.startswith(SECTION3_HEADING):
+            heading_index = index
+            continue
+        if heading_index is not None and text.startswith(SECTION4_HEADING):
+            next_index = index
+            break
+    assert heading_index is not None and next_index is not None
+    for paragraph in paragraphs[heading_index + 1 : next_index]:
+        paragraph.getparent().remove(paragraph)
+    anchor = paragraphs[heading_index]
+    for line in lines:
+        new_paragraph = document.add_paragraph(line)
+        anchor.addnext(new_paragraph._p)
+        anchor = new_paragraph._p
+
+    out = io.BytesIO()
+    document.save(out)
+    out.seek(0)
+    texts = [p.text for p in Document(out).paragraphs]
+    # 구방식 차이는 모두 삭제되어야 한다
+    assert not any("구방식" in t for t in texts)
+    # 새 차이는 3번과 4번 사이 정확한 위치에 있어야 한다
+    assert (
+        texts.index(SECTION3_HEADING)
+        < texts.index("· 매핑 검수 차이 1")
+        < texts.index(SECTION4_HEADING)
+    )
+
+
+def test_verifier_catches_truncated_body_and_missing_translation() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock, TextEdit, HanjaTranslation
+    from worker.workflows.review_verifier import verify_review_docx
+
+    body_text = "적병이 크게 궤멸되었다. 장군 흔달(昕達)·견달(見達) 등 3천 2백인을 사로잡았다."
+    footnote_text = "27) 八月五日乙酉 太保內史令徐熙卒"
+
+    def _build(include_body: bool, include_footnote: bool) -> bytes:
+        document = Document()
+        if include_body:
+            document.add_paragraph(body_text)
+        if include_footnote:
+            document.add_paragraph(footnote_text)
+        buffer = io.BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    blocks = [
+        BodyBlock(block_id="p1", text=body_text, page=10),
+        BodyBlock(block_id="p2", text=footnote_text, page=10),
+    ]
+    translations = [HanjaTranslation(item_id="p2", original=footnote_text, translation="번역")]
+
+    # 온전한 문서 → 통과
+    ok = verify_review_docx(
+        _build(include_body=True, include_footnote=True), blocks, [], translations, []
+    )
+    assert ok == []
+
+    # 본문이 잘린 문서 → 본문 유실로 실패 (152자 절단 사고 방지)
+    truncated = verify_review_docx(
+        _build(include_body=False, include_footnote=True), blocks, [], translations, []
+    )
+    assert any("본문 유실" in e for e in truncated)
+
+    # 각주가 사라진 문서 → 각주 유실로 실패
+    no_footnote = verify_review_docx(
+        _build(include_body=True, include_footnote=False), blocks, [], translations, []
+    )
+    assert any("각주 유실" in e for e in no_footnote)
+
+    # 번역이 누락된 경우 → 번역 누락으로 실패
+    no_translation = verify_review_docx(
+        _build(include_body=True, include_footnote=True), blocks, [], [], []
+    )
+    assert any("번역 누락" in e for e in no_translation)
+
+
+def test_verifier_catches_fabricated_bibliography() -> None:
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock, SourceAnnotation
+    from worker.workflows.review_verifier import verify_review_docx
+
+    body_text = "석경당이 거란 군대로써 후당을 찬탈하고, 국호를 진이라고 하였다.(구오대사 권75)"
+    document = Document()
+    document.add_paragraph(body_text)
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    blocks = [BodyBlock(block_id="p1", text=body_text, page=13)]
+
+    # 원고에 있는 서지명(구오대사) → 통과
+    ok = verify_review_docx(
+        buffer.getvalue(),
+        blocks,
+        [],
+        [],
+        [],
+        [SourceAnnotation(item_id="p1", source="『구오대사』 권75 출전 누락")],
+    )
+    assert not any("원고에 없는 서지명" in e for e in ok)
+
+    # 원고에 없는 서지명(삼국사기) → 실패
+    bad = verify_review_docx(
+        buffer.getvalue(),
+        blocks,
+        [],
+        [],
+        [],
+        [SourceAnnotation(item_id="p1", source="김부식, 《삼국사기》 권3 (추정)")],
+    )
+    assert any("원고에 없는 서지명" in e for e in bad)
+
+
+def test_verifier_accepts_skipped_edit_paragraph() -> None:
+    """교정이 건너뛰어져 원문이 남아 있어도 통과해야 한다 (오탐 방지)."""
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock, TextEdit
+    from worker.workflows.review_verifier import verify_review_docx
+
+    original = "왕이 삼군을 거느리고 개경으로 향하였다."
+    document = Document()
+    document.add_paragraph(original)  # 교정이 건너뛰어진 채 원문 그대로
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    blocks = [BodyBlock(block_id="p1", text=original, page=8)]
+    edits = [
+        TextEdit(
+            item_id="p1",
+            original=original,
+            revised=original.replace("개경으로", "개경(開京)으로"),
+            category="typo",
+            reason="한자 병기",
+        )
+    ]
+    errors = verify_review_docx(buffer.getvalue(), blocks, edits, [], [])
+    assert errors == []
+
+
+def test_reconcile_translations_matches_by_footnote_number() -> None:
+    """LLM이 item_id를 '주석 2번' 등으로 적어도 각주 번호로 매칭되어야 한다."""
+    from worker.workflows.hwp_review_models import BodyBlock, HanjaTranslation
+    from worker.workflows.pdf_document_review import reconcile_translations
+
+    blocks = [
+        BodyBlock(block_id="p3", text="2) 丙申十九年 春二月 珍熋女堧將軍朴英規請降", page=8),
+        BodyBlock(block_id="p7", text="본문 문단이다. 왕이 삼군을 거느렸다.", page=8),
+    ]
+    translations = [
+        HanjaTranslation(
+            item_id="주석 2번",
+            original="丙申十九年 春二月 珍熋女堧將軍朴英規請降",
+            translation="병신 19년 봄 2월에 진선의 장군 박영규가 항복을 청하였다.",
+        )
+    ]
+    result = reconcile_translations(blocks, translations)
+    assert len(result) == 1
+    assert result[0].item_id == "p3"
+
+
+def test_block_id_number_does_not_hijack_translation() -> None:
+    """'p3'(각주 2번 블록)의 번역이 각주 3번 블록으로 훔쳐지면 안 된다."""
+    from worker.workflows.hwp_review_models import BodyBlock, HanjaTranslation
+    from worker.workflows.pdf_document_review import (
+        match_translation_to_block,
+        reconcile_translations,
+    )
+
+    blocks = [
+        BodyBlock(block_id="p3", text="2) 丙申十九年 春二月 朴英規請降", page=8),
+        BodyBlock(block_id="p5", text="3) 十九年春二月 朴英規請內附", page=8),
+    ]
+    # LLM이 지시대로 item_id에 블록 ID 'p3'를 적고 원문에서 번호를 뺀 경우
+    translation = HanjaTranslation(
+        item_id="p3",
+        original="丙申十九年 春二月 朴英規請降",
+        translation="병신 19년 봄 2월에 박영규가 항복을 청하였다.",
+    )
+    assert match_translation_to_block(translation, blocks).block_id == "p3"
+    result = reconcile_translations(blocks, [translation])
+    assert result[0].item_id == "p3"
+
+    # 원문에 각주 번호가 있으면 그 번호가 우선한다
+    numbered = HanjaTranslation(
+        item_id="주석 2번",
+        original="2) 丙申十九年 春二月 朴英規請降",
+        translation="병신 19년 봄 2월에 박영규가 항복을 청하였다.",
+    )
+    assert match_translation_to_block(numbered, blocks).block_id == "p3"
+
+
+def test_verifier_tolerates_parenthesis_extraction_differences() -> None:
+    """pypdf '청태(淸泰) 3년' vs pdf2docx '청태3년' — 오탐이면 안 된다."""
+    import io
+
+    from docx import Document
+    from worker.workflows.hwp_review_models import BodyBlock
+    from worker.workflows.review_verifier import verify_review_docx
+
+    document = Document()
+    # pdf2docx 스타일: 괄호 없이 추출됨
+    document.add_paragraph("31) <역자 주> 책부원귀에서 형순이 사신으로 온 기록은 권976이 아니라 권972에 나온다. 또 두 차례 입공하였는데, 먼저 후당 폐제 청태3년에 왔다가 3년 후인 후진 고조 천복4년에 다시 온 것으로 되어 있다.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    # pypdf 스타일: 한자가 괄호 안에 들어있음
+    block = BodyBlock(
+        block_id="p62",
+        text="31) <역자 주> 책부원귀에서 형순이 사신으로 온 기록은 권976이 아니라 권972에 나온다. 또 두 차례 입공하였는데, 먼저 후당 폐제 청태(淸泰) 3년에 왔다가 3년 후인 후진 고조 천복(天福) 4년에 다시 온 것으로 되어 있다.",
+        page=14,
+    )
+    errors = verify_review_docx(buffer.getvalue(), [block], [], [], [])
+    assert errors == []
+
+
+def test_char_coverage_catches_real_loss_but_tolerates_reordering() -> None:
+    from worker.workflows.review_verifier import _char_coverage
+
+    needle = "왕이 삼군을 거느리고 개경으로 향하였다"
+    # 순서가 바뀌어도 글자가 다 있으면 통과
+    assert _char_coverage(needle, "향하였다 개경으로 거느리고 왕이 삼군을")
+    # 글자가 대량 소실되면 실패 (152자 절단 사고)
+    assert not _char_coverage(needle, "왕이 삼군을")
+
+
+def test_translation_label_uses_manuscript_footnote_number() -> None:
+    """LLM이 원문에서 각주 번호를 빼도 라벨은 원고 기준 번호여야 한다."""
+    from worker.workflows.hwp_review_models import HanjaTranslation, BodyBlock
+    from worker.workflows.pdf_document_review import _year_reports
+
+    section = {
+        "year": "태조 19년(임신)",
+        "edits": [],
+        "translations": [
+            # LLM이 '6)'을 뺀 채 인용한 경우 — 라벨은 원고의 6번이어야 한다
+            HanjaTranslation(
+                item_id="p11",
+                original="夏六月 珍熋請曰 老臣遲暮 來投聖化",
+                translation="여름 6월에 진선이 청하기를…",
+                footnote_number="6",
+            )
+        ],
+        "differences": [],
+        "annotations": [],
+    }
+    lines = _year_reports(section)
+    joined = "\\n".join(lines)
+    assert "**주석 6번**" in joined
+    assert "**p11**" not in joined
